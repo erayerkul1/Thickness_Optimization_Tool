@@ -84,10 +84,13 @@ def read_bdf_model(bdf_path):
             mid = prop.mid1_ref.mid if hasattr(prop, "mid1_ref") and prop.mid1_ref else prop.Mid1()
             pid_mid_map[pid] = mid
 
-    # MAT1 density değerlerini oku
+    # MAT1 density ve Young's modülüsü değerlerini oku
+    mid_E_map = {}
     for mid, mat in model.materials.items():
         if hasattr(mat, "rho"):
             mid_density_map[mid] = mat.rho
+        if hasattr(mat, "e") and mat.e is not None:
+            mid_E_map[mid] = float(mat.e)
 
     # Her PID'e ait elemanların toplam alanını hesapla
     for pid in pids:
@@ -105,7 +108,7 @@ def read_bdf_model(bdf_path):
                 except Exception:
                     pass
 
-    return pids, pid_mid_map, mid_density_map, pid_area_map, eid_pid_map, eid_area_map
+    return pids, pid_mid_map, mid_density_map, mid_E_map, pid_area_map, eid_pid_map, eid_area_map
 
 
 def compute_real_mass(thickness_map, pid_mid_map, mid_density_map, pid_area_map):
@@ -973,6 +976,399 @@ def optimize_genetic(bdf_path, nastran_exe, output_dir, pids, allowable_map,
 
 
 # ---------------------------------------------------------------------------
+# ALGORİTMA 3: OC + sep-CMA-ES Hibrit
+# ---------------------------------------------------------------------------
+
+def compute_oc_sensitivities(thickness_map, stress_map, pid_mid_map,
+                              mid_density_map, mid_E_map,
+                              eid_pid_map, eid_area_map, pid_area_map):
+    """OP2 Von Mises stres verisinden strain energy bazlı OC sensitivitesi hesaplar.
+    Returns: (sensitivities {pid: B_i}, pid_SE {pid: strain_energy})
+    """
+    pid_SE = {pid: 0.0 for pid in thickness_map}
+    for eid, vm in stress_map.items():
+        pid = eid_pid_map.get(eid)
+        if pid is None or pid not in thickness_map:
+            continue
+        mid = pid_mid_map.get(pid)
+        E = mid_E_map.get(mid, 7e10)          # fallback: aluminyum civarı
+        t = thickness_map[pid]
+        A_e = eid_area_map.get(eid, 0.0)
+        pid_SE[pid] += (vm ** 2) / (2.0 * max(E, 1.0)) * t * A_e
+
+    # Sıfır SE olan PID'ler için küçük fallback (veri eksikliği durumu)
+    nonzero = [v for v in pid_SE.values() if v > 0.0]
+    avg_SE = (np.mean(nonzero) * 0.01) if nonzero else 1e-15
+    for pid in pid_SE:
+        if pid_SE[pid] == 0.0:
+            pid_SE[pid] = avg_SE
+
+    # B_i = SE_i / (rho_i * A_total_i * t_i^2)
+    sensitivities = {}
+    for pid, t in thickness_map.items():
+        mid = pid_mid_map.get(pid)
+        rho = mid_density_map.get(mid, 1.0)
+        A_total = max(pid_area_map.get(pid, 1.0), 1e-10)
+        denom = rho * A_total * max(t ** 2, 1e-10)
+        sensitivities[pid] = pid_SE[pid] / denom
+
+    return sensitivities, pid_SE
+
+
+def oc_update_step(thickness_map, sensitivities, pid_SE, pid_bounds,
+                   max_disp, max_disp_limit, move_limit=0.2, eta=0.5):
+    """OC güncelleme adımı: lambda bisection ile yeni kalınlıkları hesaplar.
+    Displacement tahmini için reciprocal approximation kullanır (Nastran çalışması yok).
+    """
+    pids_list = list(thickness_map.keys())
+    t_arr     = np.array([thickness_map[p]    for p in pids_list])
+    B_arr     = np.array([sensitivities[p]    for p in pids_list])
+    SE_arr    = np.array([pid_SE[p]           for p in pids_list])
+    SE_total  = max(float(SE_arr.sum()), 1e-30)
+    tmin_arr  = np.array([pid_bounds[p][0]    for p in pids_list])
+    tmax_arr  = np.array([pid_bounds[p][1]    for p in pids_list])
+    tstep_arr = np.array([pid_bounds[p][2]    for p in pids_list])
+
+    def t_new_fn(lam):
+        raw = t_arr * (B_arr / max(float(lam), 1e-30)) ** eta
+        raw = np.clip(raw, t_arr * (1.0 - move_limit), t_arr * (1.0 + move_limit))
+        return np.clip(raw, tmin_arr, tmax_arr)
+
+    def u_pred(lam):
+        tn = t_new_fn(lam)
+        ratio = np.where(tn > 1e-10, t_arr / tn, 1.0)
+        return max_disp * float((SE_arr * ratio).sum() / SE_total)
+
+    # Lambda sınırlarını bul
+    lam_lo = 1e-10
+    lam_hi = max(float(B_arr.max()) * 10.0, 1.0)
+    for _ in range(60):
+        if u_pred(lam_hi) <= max_disp_limit:
+            break
+        lam_hi *= 2.0
+
+    # Bisection
+    for _ in range(60):
+        lam_mid = 0.5 * (lam_lo + lam_hi)
+        if u_pred(lam_mid) > max_disp_limit:
+            lam_lo = lam_mid
+        else:
+            lam_hi = lam_mid
+
+    t_new = t_new_fn(0.5 * (lam_lo + lam_hi))
+    t_rounded = np.round(np.round(t_new / np.maximum(tstep_arr, 1e-10)) * tstep_arr, 1)
+    t_rounded = np.clip(t_rounded, tmin_arr, tmax_arr)
+    return {pids_list[i]: float(t_rounded[i]) for i in range(len(pids_list))}
+
+
+class SepCMAES:
+    """sep-CMA-ES: diyagonal kovaryans matrisli CMA-ES, büyük n için verimli.
+
+    Her nesil ask() → evaluate → tell() döngüsü ile çalışır.
+    pop_size = n_parallel olduğunda her nesil = 1 paralel Nastran turu.
+    """
+
+    def __init__(self, x0, sigma0, pop_size=None):
+        self.n = len(x0)
+        self.m = np.asarray(x0, dtype=float).copy()
+        self.sigma = float(sigma0)
+        self.d = np.ones(self.n)                  # diyagonal standart sapmalar
+
+        lam = pop_size or (4 + int(3.0 * np.log(max(self.n, 2))))
+        mu  = max(lam // 2, 1)
+        w_raw = np.log(mu + 0.5) - np.log(np.arange(1, mu + 1, dtype=float))
+        w = w_raw / w_raw.sum()
+        mu_eff = 1.0 / float((w ** 2).sum())
+
+        n = self.n
+        self.lam, self.mu, self.w, self.mu_eff = lam, mu, w, mu_eff
+
+        self.c_sigma = (mu_eff + 2.0) / (n + mu_eff + 5.0)
+        self.d_sigma = (1.0 + self.c_sigma
+                        + 2.0 * max(0.0, np.sqrt((mu_eff - 1.0) / (n + 1.0)) - 1.0))
+        self.chi_n   = n ** 0.5 * (1.0 - 1.0 / (4.0 * n) + 1.0 / (21.0 * n ** 2))
+        self.c_c  = (4.0 + mu_eff / n) / (n + 4.0 + 2.0 * mu_eff / n)
+        self.c1   = 2.0 / ((n + 1.3) ** 2 + mu_eff)
+        self.cmu  = min(1.0 - self.c1,
+                        2.0 * (mu_eff - 2.0 + 1.0 / mu_eff) / ((n + 2.0) ** 2 + mu_eff))
+        self.p_sigma = np.zeros(n)
+        self.p_c     = np.zeros(n)
+        self.gen = 0
+
+    def ask(self, rng):
+        """Lambda aday çözüm örnekle."""
+        self._last_xs_raw = self.m + self.sigma * rng.standard_normal((self.lam, self.n)) * self.d
+        return self._last_xs_raw.copy()
+
+    def tell(self, xs, fs):
+        """xs: (lam, n) değerlendirilen noktalar; fs: (lam,) fitness (minimize)."""
+        idx = np.argsort(fs)[:self.mu]
+        sel = xs[idx]
+        old_m = self.m.copy()
+        self.m = (self.w[:, None] * sel).sum(axis=0)
+        step  = (self.m - old_m) / self.sigma
+
+        # Step-size evolution path
+        self.p_sigma = ((1.0 - self.c_sigma) * self.p_sigma
+                        + np.sqrt(self.c_sigma * (2.0 - self.c_sigma) * self.mu_eff)
+                          * step / np.maximum(self.d, 1e-30))
+        norm_ps = float(np.linalg.norm(self.p_sigma))
+        self.sigma *= np.exp(self.c_sigma / self.d_sigma * (norm_ps / self.chi_n - 1.0))
+        self.sigma = float(np.clip(self.sigma, 1e-12, 1e4))
+
+        denom_hs = np.sqrt(1.0 - (1.0 - self.c_sigma) ** (2.0 * (self.gen + 1)))
+        h = float(norm_ps / max(denom_hs, 1e-30) / self.chi_n < 1.4 + 2.0 / (self.n + 1.0))
+
+        # Covariance evolution path
+        self.p_c = ((1.0 - self.c_c) * self.p_c
+                    + h * np.sqrt(self.c_c * (2.0 - self.c_c) * self.mu_eff) * step)
+
+        # Diyagonal kovaryans güncelleme
+        y_sel = (sel - old_m) / self.sigma
+        d_sq  = ((1.0 - self.c1 - self.cmu) * self.d ** 2
+                 + self.c1  * self.p_c ** 2
+                 + self.cmu * (self.w[:, None] * y_sel ** 2).sum(axis=0))
+        self.d = np.sqrt(np.maximum(d_sq, 1e-20))
+        self.gen += 1
+
+
+def optimize_oc_sepcmaes(bdf_path, nastran_exe, output_dir, pids, allowable_map,
+                          min_t, max_t, step, max_disp_limit, max_iter,
+                          log_callback, progress_callback, tracker, n_parallel=1, memory_mb=0,
+                          pid_mid_map=None, mid_density_map=None, pid_area_map=None,
+                          pid_bounds=None, stress_mode="Element Based", sigma_count=0,
+                          eid_pid_map=None, eid_area_map=None, scratch_dir=None,
+                          disp_direction="Mag", node_filter=None, mid_E_map=None):
+    """Hibrit OC + sep-CMA-ES optimizasyon.
+
+    Faz 1 — OC: strain energy sensitivitesi ile hızlı lokal yakınsama (1 run/iter).
+    Faz 2 — sep-CMA-ES: OC çözümünden global arama, pop_size=n_parallel ile
+             her nesil tek bir paralel Nastran turu.
+    """
+    n = len(pids)
+    if mid_E_map is None:
+        mid_E_map = {}
+
+    # Faz bölünmesi
+    oc_iters  = max(10, min(30, max_iter // 3))
+    cma_iters = max(1, max_iter - oc_iters)
+
+    # Per-PID sınırlar
+    if pid_bounds:
+        pid_min_d  = {p: pid_bounds[p][0] for p in pids}
+        pid_max_d  = {p: pid_bounds[p][1] for p in pids}
+        pid_step_d = {p: pid_bounds[p][2] for p in pids}
+    else:
+        pid_min_d  = {p: min_t  for p in pids}
+        pid_max_d  = {p: max_t  for p in pids}
+        pid_step_d = {p: step   for p in pids}
+
+    pid_bounds_full = {p: (pid_min_d[p], pid_max_d[p], pid_step_d[p]) for p in pids}
+    pid_min_arr  = np.array([pid_min_d[p]  for p in pids])
+    pid_max_arr  = np.array([pid_max_d[p]  for p in pids])
+    pid_step_arr = np.array([pid_step_d[p] for p in pids])
+
+    pop_size = max(n_parallel, 4 + int(3.0 * np.log(max(n, 2))))
+
+    log_callback(f"\n  OC + sep-CMA-ES Hibrit — {n} PSHELL, Paralel: {n_parallel}")
+    log_callback(f"  Faz 1 (OC): {oc_iters} iterasyon  |  Faz 2 (CMA-ES): {cma_iters} nesil, pop={pop_size}")
+
+    def _fitness(t_map, max_disp_val, stress_ok_val):
+        mass, _ = compute_real_mass(t_map, pid_mid_map, mid_density_map, pid_area_map)
+        penalty = 0.0
+        if max_disp_val > max_disp_limit:
+            penalty += 1000.0 * (max_disp_val - max_disp_limit)
+        if not stress_ok_val:
+            penalty += 500.0
+        return mass + penalty
+
+    # ── BAŞLANGIÇ: orta nokta ──────────────────────────────────────────────
+    current_t = {p: round(float((pid_min_d[p] + pid_max_d[p]) / 2.0), 1) for p in pids}
+
+    # ══════════════════════════════════════════════════════════════════════
+    # FAZ 1: OC
+    # ══════════════════════════════════════════════════════════════════════
+    log_callback(f"\n{'='*50}")
+    log_callback("FAZ 1: Optimality Criteria (OC)")
+    log_callback("  Strain energy bazlı sensitivite — 1 Nastran / iterasyon")
+
+    oc_best_t    = None
+    oc_best_mass = float('inf')
+
+    for oc_i in range(oc_iters):
+        progress_callback((oc_i / max_iter) * 100.0)
+        work_dir = os.path.join(output_dir, f"oc_iter{oc_i + 1}")
+        try:
+            max_disp, stress_map = solve_and_evaluate(
+                nastran_exe, bdf_path, current_t, work_dir, log_callback,
+                memory_mb=memory_mb, scratch_dir=scratch_dir,
+                disp_direction=disp_direction, node_filter=node_filter
+            )
+            stress_ok, _, max_vm = do_stress_check(
+                stress_map, allowable_map, stress_mode, sigma_count,
+                eid_pid_map, eid_area_map)
+            tracker.record(f"OC_{oc_i + 1}", current_t, max_disp, max_vm, stress_ok,
+                           allowable_map, log_callback)
+
+            log_callback(f"  OC {oc_i+1}/{oc_iters}: disp={max_disp:.6f} "
+                         f"({'OK' if max_disp <= max_disp_limit else 'FAIL'}), "
+                         f"stress={'OK' if stress_ok else 'FAIL'}")
+
+            # En iyi feasible OC çözümünü sakla
+            if max_disp <= max_disp_limit and stress_ok:
+                mass_now, _ = compute_real_mass(
+                    current_t, pid_mid_map, mid_density_map, pid_area_map)
+                if mass_now < oc_best_mass:
+                    oc_best_mass = mass_now
+                    oc_best_t = dict(current_t)
+
+            # OC sensitivite + güncelleme
+            sensitivities, pid_SE = compute_oc_sensitivities(
+                current_t, stress_map, pid_mid_map, mid_density_map, mid_E_map,
+                eid_pid_map, eid_area_map, pid_area_map
+            )
+            current_t = oc_update_step(
+                current_t, sensitivities, pid_SE, pid_bounds_full,
+                max_disp, max_disp_limit, move_limit=0.2, eta=0.5
+            )
+        except Exception as exc:
+            log_callback(f"  [Hata] OC iterasyon {oc_i + 1}: {exc}")
+
+    if oc_best_t is not None:
+        cma_start = oc_best_t
+        log_callback(f"\n  OC bitti — en iyi feasible kütle: {oc_best_mass:.4f} kg")
+    else:
+        cma_start = current_t
+        log_callback("\n  OC bitti — feasible çözüm bulunamadı, son iterasyondan devam")
+
+    # ══════════════════════════════════════════════════════════════════════
+    # FAZ 2: sep-CMA-ES
+    # ══════════════════════════════════════════════════════════════════════
+    log_callback(f"\n{'='*50}")
+    log_callback(f"FAZ 2: sep-CMA-ES  (pop={pop_size}, nesil={cma_iters})")
+
+    x0 = np.array([cma_start.get(p, (pid_min_d[p] + pid_max_d[p]) / 2.0) for p in pids])
+    sigma0 = float(np.mean(pid_max_arr - pid_min_arr) * 0.1)
+
+    cma   = SepCMAES(x0, sigma0, pop_size=pop_size)
+    rng   = np.random.RandomState(42)
+
+    cma_best_t       = None
+    cma_best_fitness = float('inf')
+    cma_best_disp    = float('inf')
+    cma_best_stress  = {}
+
+    for cma_gen in range(cma_iters):
+        progress_callback(((oc_iters + cma_gen) / max_iter) * 100.0)
+
+        # Örnekle ve sınırlara kırp
+        raw = cma.ask(rng)
+        samples = np.clip(raw, pid_min_arr, pid_max_arr)
+        samples = np.round(samples / np.maximum(pid_step_arr, 1e-10)) * pid_step_arr
+        samples = np.round(np.clip(samples, pid_min_arr, pid_max_arr), 1)
+
+        t_maps = [
+            {pids[j]: float(samples[i, j]) for j in range(n)}
+            for i in range(cma.lam)
+        ]
+
+        fitnesses = np.full(cma.lam, float('inf'))
+
+        if n_parallel > 1:
+            batch_items = [
+                (t_maps[i], os.path.join(output_dir, f"cma_g{cma_gen+1}_i{i}"))
+                for i in range(cma.lam)
+            ]
+            try:
+                batch_results = solve_batch(
+                    nastran_exe, bdf_path, batch_items, n_parallel,
+                    log_callback, memory_mb=memory_mb, scratch_dir=scratch_dir,
+                    disp_direction=disp_direction, node_filter=node_filter
+                )
+            except Exception as exc:
+                log_callback(f"  [Hata] CMA-ES Gen {cma_gen+1} batch: {exc}")
+                batch_results = [(t_maps[i], 1e10, {}) for i in range(cma.lam)]
+
+            for i, item in enumerate(batch_results):
+                try:
+                    if item is None:
+                        continue
+                    t_map, max_disp, stress_map = item
+                    stress_ok, _, max_vm = do_stress_check(
+                        stress_map, allowable_map, stress_mode, sigma_count,
+                        eid_pid_map, eid_area_map)
+                    fitnesses[i] = _fitness(t_maps[i], max_disp, stress_ok)
+                    tracker.record(f"CMA_G{cma_gen+1}_{i+1}", t_maps[i], max_disp, max_vm,
+                                   stress_ok, allowable_map, log_callback)
+                    if fitnesses[i] < cma_best_fitness:
+                        cma_best_fitness = fitnesses[i]
+                        cma_best_t       = dict(t_maps[i])
+                        cma_best_disp    = max_disp
+                        cma_best_stress  = stress_map or {}
+                except Exception as exc:
+                    log_callback(f"  [Hata] CMA-ES Gen {cma_gen+1} Birey #{i+1}: {exc}")
+        else:
+            for i in range(cma.lam):
+                work_dir = os.path.join(output_dir, f"cma_g{cma_gen+1}_i{i}")
+                try:
+                    max_disp, stress_map = solve_and_evaluate(
+                        nastran_exe, bdf_path, t_maps[i], work_dir, log_callback,
+                        memory_mb=memory_mb, scratch_dir=scratch_dir,
+                        disp_direction=disp_direction, node_filter=node_filter
+                    )
+                    stress_ok, _, max_vm = do_stress_check(
+                        stress_map, allowable_map, stress_mode, sigma_count,
+                        eid_pid_map, eid_area_map)
+                    fitnesses[i] = _fitness(t_maps[i], max_disp, stress_ok)
+                    tracker.record(f"CMA_G{cma_gen+1}_{i+1}", t_maps[i], max_disp, max_vm,
+                                   stress_ok, allowable_map, log_callback)
+                    if fitnesses[i] < cma_best_fitness:
+                        cma_best_fitness = fitnesses[i]
+                        cma_best_t       = dict(t_maps[i])
+                        cma_best_disp    = max_disp
+                        cma_best_stress  = stress_map or {}
+                except Exception as exc:
+                    log_callback(f"  [Hata] CMA-ES Gen {cma_gen+1} Birey #{i+1}: {exc}")
+
+        cma.tell(samples, fitnesses)
+        best_i = int(np.argmin(fitnesses))
+        log_callback(f"  CMA Gen {cma_gen+1}/{cma_iters}: "
+                     f"best_fit={fitnesses[best_i]:.4f}, sigma={cma.sigma:.4f}")
+
+    # CMA-ES başlangıç noktası dönmüşse kullan
+    if cma_best_t is None:
+        cma_best_t = {pids[j]: round(float(cma.m[j]), 1) for j in range(n)}
+
+    # OC ve CMA-ES en iyilerini karşılaştır
+    if oc_best_t is not None:
+        cma_mass, _ = compute_real_mass(cma_best_t, pid_mid_map, mid_density_map, pid_area_map)
+        if oc_best_mass < cma_mass:
+            log_callback(f"\n  OC çözümü daha hafif ({oc_best_mass:.4f} < {cma_mass:.4f} kg) — OC kullanılıyor.")
+            best_t = oc_best_t
+        else:
+            best_t = cma_best_t
+    else:
+        best_t = cma_best_t
+
+    # Final çözüm
+    log_callback(f"\n{'='*50}")
+    log_callback("SON ÇÖZÜM")
+    final_dir = os.path.join(output_dir, "final_result")
+    final_disp, final_stress = solve_and_evaluate(
+        nastran_exe, bdf_path, best_t, final_dir, log_callback,
+        memory_mb=memory_mb, scratch_dir=scratch_dir,
+        disp_direction=disp_direction, node_filter=node_filter
+    )
+    stress_ok, _, max_vm = do_stress_check(
+        final_stress, allowable_map, stress_mode, sigma_count,
+        eid_pid_map, eid_area_map)
+    tracker.record("Final", best_t, final_disp, max_vm, stress_ok, allowable_map, log_callback)
+
+    progress_callback(100)
+    return best_t, final_disp, final_stress
+
+
+# ---------------------------------------------------------------------------
 # Çıktı dosyası temizleme (saklama moduna göre)
 # ---------------------------------------------------------------------------
 
@@ -1208,6 +1604,7 @@ class NastranToolApp:
         algo_combo["values"] = (
             "FD + SQP (Forward Difference)",
             "Genetic Algorithm (GA)",
+            "OC + sep-CMA-ES (Hibrit)",
         )
         algo_combo.current(0)
         algo_combo.grid(row=3, column=1, columnspan=4, sticky=tk.W, padx=2, pady=(4, 0))
@@ -1436,7 +1833,7 @@ class NastranToolApp:
         # BDF'den PSHELL sayısını oku
         try:
             self._log("BDF okunuyor (PSHELL sayısı için)...")
-            pids, _, _, _, _, _ = read_bdf_model(bdf_path)
+            pids, _, _, _, _, _, _ = read_bdf_model(bdf_path)
             n_pids = len(pids)
             if n_pids == 0:
                 messagebox.showerror("Hata", "BDF dosyasında PSHELL bulunamadı.")
@@ -1466,6 +1863,15 @@ class NastranToolApp:
             pop_size = max(10, 2 * n_pids)
             total_run = pop_size * max_iter + 1
             detail = f"{pop_size} pop x {max_iter} gen + 1 final  [step={step} yuvarlama]"
+
+        elif "OC" in algo_name or "CMA" in algo_name:
+            oc_iters_est  = max(10, min(30, max_iter // 3))
+            cma_iters_est = max(1, max_iter - oc_iters_est)
+            cma_pop       = max(n_parallel, 4 + int(3 * np.log(max(n_pids, 2))))
+            rounds_per_gen = max(1, -(-cma_pop // max(n_parallel, 1)))  # ceiling division
+            total_run = oc_iters_est + cma_iters_est * rounds_per_gen + 1
+            detail = (f"OC: {oc_iters_est} run + "
+                      f"CMA: {cma_iters_est} nesil x ⌈{cma_pop}/{n_parallel}⌉={rounds_per_gen} tur + 1 final")
 
         else:
             total_run = max_iter + 1
@@ -1540,7 +1946,7 @@ class NastranToolApp:
 
             # BDF'den mass bilgisi
             self._log("\nBDF okunuyor (mass hesabı)...")
-            pids, pid_mid_map, mid_density_map, pid_area_map, _, _ = read_bdf_model(bdf_path)
+            pids, pid_mid_map, mid_density_map, _, pid_area_map, _, _ = read_bdf_model(bdf_path)
             # Mevcut kalınlıkları oku
             bdf_model = BDF()
             bdf_model.read_bdf(bdf_path, xref=False)
@@ -1656,7 +2062,7 @@ class NastranToolApp:
 
             # BDF'den PSHELL, malzeme ve alan bilgisi oku
             self._log("\nBDF modeli okunuyor...")
-            pids, pid_mid_map, mid_density_map, pid_area_map, eid_pid_map, eid_area_map = read_bdf_model(bdf_path)
+            pids, pid_mid_map, mid_density_map, mid_E_map, pid_area_map, eid_pid_map, eid_area_map = read_bdf_model(bdf_path)
             if not pids:
                 raise ValueError("BDF dosyasında PSHELL kartı bulunamadı!")
             self._log(f"  {len(pids)} PSHELL bulundu")
@@ -1722,10 +2128,16 @@ class NastranToolApp:
 
             if "FD" in algo_name or "SQP" in algo_name:
                 result_t, final_disp, final_stress = optimize_fd_sqp(**algo_kwargs)
-            else:
-                algo_kwargs["pid_mid_map"] = pid_mid_map
+            elif "OC" in algo_name or "CMA" in algo_name:
+                algo_kwargs["pid_mid_map"]     = pid_mid_map
                 algo_kwargs["mid_density_map"] = mid_density_map
-                algo_kwargs["pid_area_map"] = pid_area_map
+                algo_kwargs["pid_area_map"]    = pid_area_map
+                algo_kwargs["mid_E_map"]       = mid_E_map
+                result_t, final_disp, final_stress = optimize_oc_sepcmaes(**algo_kwargs)
+            else:
+                algo_kwargs["pid_mid_map"]     = pid_mid_map
+                algo_kwargs["mid_density_map"] = mid_density_map
+                algo_kwargs["pid_area_map"]    = pid_area_map
                 result_t, final_disp, final_stress = optimize_genetic(**algo_kwargs)
 
             # Tüm iterasyonları tara: displacement + stress kısıtını sağlayan en hafif çözüm
