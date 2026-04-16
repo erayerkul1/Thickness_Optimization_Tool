@@ -255,14 +255,22 @@ def get_von_mises_stresses(op2_model):
     return stress_map
 
 
-def get_max_absolute_displacement(op2_model):
+def get_max_absolute_displacement(op2_model, direction="Mag"):
+    """OP2 modelinden maksimum displacement değerini okur.
+    direction: 'Mag' (büyüklük), 'X' (T1), 'Y' (T2), 'Z' (T3)
+    """
+    _dir_idx = {"X": 0, "Y": 1, "Z": 2}
     max_disp = 0.0
     if not op2_model.displacements:
         return 0.0
     for subcase_id, disp_obj in op2_model.displacements.items():
-        translations = disp_obj.data[:, :, :3]
-        magnitudes = np.sqrt(np.sum(translations ** 2, axis=2))
-        current_max = float(np.max(magnitudes))
+        if direction == "Mag":
+            translations = disp_obj.data[:, :, :3]
+            values = np.sqrt(np.sum(translations ** 2, axis=2))
+        else:
+            idx = _dir_idx[direction]
+            values = np.abs(disp_obj.data[:, :, idx])
+        current_max = float(np.max(values))
         if current_max > max_disp:
             max_disp = current_max
     return max_disp
@@ -404,22 +412,25 @@ def check_stress_constraints_average(avg_stress_data, prop_allowable_map):
     return len(failed) == 0, failed, max_eff
 
 
-def log_mass_summary(total_mass, max_disp, max_disp_limit, max_vm, stress_ok, log_callback):
+def log_mass_summary(total_mass, max_disp, max_disp_limit, max_vm, stress_ok, log_callback,
+                     disp_direction="Mag"):
     """Mass Summary: toplam mass, max displacement, max stress"""
     disp_status = "OK" if max_disp <= max_disp_limit else "FAIL"
     stress_status = "OK" if stress_ok else "FAIL"
+    disp_label = f"Max Disp ({disp_direction}):"
     log_callback("")
     log_callback("  ╔══════════════════════════════════════════╗")
     log_callback("  ║           MASS SUMMARY                   ║")
     log_callback("  ╠══════════════════════════════════════════╣")
     log_callback(f"  ║  Total Mass:        {total_mass:>12.4f}  kg     ║")
-    log_callback(f"  ║  Max Displacement:  {max_disp:>12.6f}  [{disp_status:>4}] ║")
+    log_callback(f"  ║  {disp_label:<20} {max_disp:>12.6f}  [{disp_status:>4}] ║")
     log_callback(f"  ║  Max Von Mises:     {max_vm:>12.2f}  [{stress_status:>4}] ║")
     log_callback("  ╚══════════════════════════════════════════╝")
     log_callback("")
 
 
-def solve_and_evaluate(nastran_exe, bdf_path, thickness_map, work_dir, log_callback, memory_mb=0, scratch_dir=None):
+def solve_and_evaluate(nastran_exe, bdf_path, thickness_map, work_dir, log_callback, memory_mb=0, scratch_dir=None,
+                       disp_direction="Mag"):
     """BDF'yi değiştir, çöz, sonuçları oku, CSV yaz, OP2 ve büyük dosyaları sil."""
     os.makedirs(work_dir, exist_ok=True)
     bdf_basename = os.path.basename(bdf_path)
@@ -430,7 +441,7 @@ def solve_and_evaluate(nastran_exe, bdf_path, thickness_map, work_dir, log_callb
     op2_model = OP2()
     op2_model.read_op2(op2_path)
 
-    max_disp = get_max_absolute_displacement(op2_model)
+    max_disp = get_max_absolute_displacement(op2_model, direction=disp_direction)
     stress_map = get_von_mises_stresses(op2_model)
 
     iter_label = os.path.basename(work_dir)
@@ -459,7 +470,8 @@ def cleanup_nastran_outputs(work_dir, log_callback):
         log_callback(f"  {deleted} Nastran çıktı dosyası silindi.")
 
 
-def solve_batch(nastran_exe, bdf_path, batch_items, n_parallel, log_callback, memory_mb=0, scratch_dir=None):
+def solve_batch(nastran_exe, bdf_path, batch_items, n_parallel, log_callback, memory_mb=0, scratch_dir=None,
+                disp_direction="Mag"):
     """
     Birden fazla thickness kombinasyonunu paralel olarak çözer.
     batch_items: [(thickness_map, work_dir), ...]
@@ -469,7 +481,8 @@ def solve_batch(nastran_exe, bdf_path, batch_items, n_parallel, log_callback, me
 
     def _solve_one(idx, thickness_map, work_dir):
         max_disp, stress_map = solve_and_evaluate(
-            nastran_exe, bdf_path, thickness_map, work_dir, log_callback, memory_mb=memory_mb, scratch_dir=scratch_dir
+            nastran_exe, bdf_path, thickness_map, work_dir, log_callback, memory_mb=memory_mb,
+            scratch_dir=scratch_dir, disp_direction=disp_direction
         )
         return idx, thickness_map, max_disp, stress_map
 
@@ -533,7 +546,7 @@ def optimize_fd_sqp(bdf_path, nastran_exe, output_dir, pids, allowable_map,
                     min_t, max_t, step, max_disp_limit, max_iter,
                     log_callback, progress_callback, tracker, n_parallel=1, memory_mb=0,
                     pid_bounds=None, stress_mode="Element Based", sigma_count=0,
-                    eid_pid_map=None, eid_area_map=None, scratch_dir=None):
+                    eid_pid_map=None, eid_area_map=None, scratch_dir=None, disp_direction="Mag"):
     """Forward Difference ile gradyan hesaplayıp SciPy trust-constr (SQP) ile optimize eder."""
     from scipy.optimize import minimize, NonlinearConstraint
 
@@ -564,7 +577,8 @@ def optimize_fd_sqp(bdf_path, nastran_exe, output_dir, pids, allowable_map,
         work_dir = os.path.join(output_dir, f"{label_prefix}_eval{eval_count[0]}")
         try:
             max_disp, stress_map = solve_and_evaluate(
-                nastran_exe, bdf_path, t_map, work_dir, log_callback, memory_mb=memory_mb, scratch_dir=scratch_dir
+                nastran_exe, bdf_path, t_map, work_dir, log_callback, memory_mb=memory_mb,
+                scratch_dir=scratch_dir, disp_direction=disp_direction
             )
             stress_ok, _, max_vm = do_stress_check(
                 stress_map, allowable_map, stress_mode, sigma_count,
@@ -610,7 +624,7 @@ def optimize_fd_sqp(bdf_path, nastran_exe, output_dir, pids, allowable_map,
                 w_dir = os.path.join(output_dir, f"fd_grad_{eval_count[0]}_p{i}")
                 batch_items.append((t_map, w_dir))
 
-            batch_results = solve_batch(nastran_exe, bdf_path, batch_items, n_parallel, log_callback, memory_mb=memory_mb, scratch_dir=scratch_dir)
+            batch_results = solve_batch(nastran_exe, bdf_path, batch_items, n_parallel, log_callback, memory_mb=memory_mb, scratch_dir=scratch_dir, disp_direction=disp_direction)
             grad = np.zeros(n)
             for i, (_, pert_disp, _) in enumerate(batch_results):
                 grad[i] = (pert_disp - f0) / pid_step[i]
@@ -650,7 +664,8 @@ def optimize_fd_sqp(bdf_path, nastran_exe, output_dir, pids, allowable_map,
 
     final_dir = os.path.join(output_dir, "final_result")
     final_disp, final_stress = solve_and_evaluate(
-        nastran_exe, bdf_path, final_t, final_dir, log_callback, memory_mb=memory_mb, scratch_dir=scratch_dir
+        nastran_exe, bdf_path, final_t, final_dir, log_callback, memory_mb=memory_mb,
+        scratch_dir=scratch_dir, disp_direction=disp_direction
     )
     stress_ok, _, max_vm = do_stress_check(
         final_stress, allowable_map, stress_mode, sigma_count,
@@ -670,7 +685,7 @@ def optimize_genetic(bdf_path, nastran_exe, output_dir, pids, allowable_map,
                      log_callback, progress_callback, tracker, n_parallel=1, memory_mb=0,
                      pid_mid_map=None, mid_density_map=None, pid_area_map=None,
                      pid_bounds=None, stress_mode="Element Based", sigma_count=0,
-                     eid_pid_map=None, eid_area_map=None, scratch_dir=None):
+                     eid_pid_map=None, eid_area_map=None, scratch_dir=None, disp_direction="Mag"):
     """Genetik Algoritma ile kalınlık optimizasyonu."""
     n = len(pids)
     eval_count = [0]
@@ -763,7 +778,7 @@ def optimize_genetic(bdf_path, nastran_exe, output_dir, pids, allowable_map,
 
             log_callback(f"  {pop_size} birey paralel değerlendiriliyor...")
             try:
-                batch_results = solve_batch(nastran_exe, bdf_path, batch_items, n_parallel, log_callback, memory_mb=memory_mb, scratch_dir=scratch_dir)
+                batch_results = solve_batch(nastran_exe, bdf_path, batch_items, n_parallel, log_callback, memory_mb=memory_mb, scratch_dir=scratch_dir, disp_direction=disp_direction)
                 for i, (t_map, max_disp, stress_map) in enumerate(batch_results):
                     stress_ok, _, max_vm = do_stress_check(
                         stress_map, allowable_map, stress_mode, sigma_count,
@@ -787,7 +802,8 @@ def optimize_genetic(bdf_path, nastran_exe, output_dir, pids, allowable_map,
                 w_dir = os.path.join(output_dir, f"ga_gen{gen}_ind{i}")
                 try:
                     max_disp, stress_map = solve_and_evaluate(
-                        nastran_exe, bdf_path, t_maps[i], w_dir, log_callback, memory_mb=memory_mb, scratch_dir=scratch_dir
+                        nastran_exe, bdf_path, t_maps[i], w_dir, log_callback, memory_mb=memory_mb,
+                        scratch_dir=scratch_dir, disp_direction=disp_direction
                     )
                     stress_ok, _, max_vm = do_stress_check(
                         stress_map, allowable_map, stress_mode, sigma_count,
@@ -880,7 +896,8 @@ def optimize_genetic(bdf_path, nastran_exe, output_dir, pids, allowable_map,
     log_callback("SON ÇÖZÜM")
     final_dir = os.path.join(output_dir, "final_result")
     final_disp, final_stress = solve_and_evaluate(
-        nastran_exe, bdf_path, best_t, final_dir, log_callback, memory_mb=memory_mb, scratch_dir=scratch_dir
+        nastran_exe, bdf_path, best_t, final_dir, log_callback, memory_mb=memory_mb,
+        scratch_dir=scratch_dir, disp_direction=disp_direction
     )
     stress_ok, _, max_vm = do_stress_check(
         final_stress, allowable_map, stress_mode, sigma_count,
@@ -1080,14 +1097,20 @@ class NastranToolApp:
         self.max_disp_entry.grid(row=1, column=1, padx=2, pady=(4, 0))
         self.max_disp_entry.insert(0, "10.0")
 
-        ttk.Label(param_frame, text="Max Iter:").grid(row=1, column=2, sticky=tk.W, padx=2, pady=(4, 0))
+        ttk.Label(param_frame, text="Yön:").grid(row=1, column=2, sticky=tk.W, padx=(8, 2), pady=(4, 0))
+        self.disp_dir_var = tk.StringVar(value="Mag")
+        disp_dir_combo = ttk.Combobox(param_frame, textvariable=self.disp_dir_var,
+                                      values=["Mag", "X", "Y", "Z"], state="readonly", width=5)
+        disp_dir_combo.grid(row=1, column=3, padx=2, pady=(4, 0), sticky=tk.W)
+
+        ttk.Label(param_frame, text="Max Iter:").grid(row=1, column=4, sticky=tk.W, padx=2, pady=(4, 0))
         self.max_iter_entry = ttk.Entry(param_frame, width=8)
-        self.max_iter_entry.grid(row=1, column=3, padx=2, pady=(4, 0))
+        self.max_iter_entry.grid(row=1, column=5, padx=2, pady=(4, 0))
         self.max_iter_entry.insert(0, "20")
 
-        ttk.Label(param_frame, text="Paralel Run:").grid(row=1, column=4, sticky=tk.W, padx=2, pady=(4, 0))
+        ttk.Label(param_frame, text="Paralel Run:").grid(row=1, column=6, sticky=tk.W, padx=2, pady=(4, 0))
         self.n_parallel_entry = ttk.Entry(param_frame, width=8)
-        self.n_parallel_entry.grid(row=1, column=5, padx=2, pady=(4, 0))
+        self.n_parallel_entry.grid(row=1, column=7, padx=2, pady=(4, 0))
         self.n_parallel_entry.insert(0, "1")
 
         ttk.Label(param_frame, text="Memory (MB):").grid(row=2, column=0, sticky=tk.W, padx=2, pady=(4, 0))
@@ -1194,9 +1217,9 @@ class NastranToolApp:
         self.ax_mass.set_ylabel("Mass (kg)")
         self.ax_mass.grid(True, alpha=0.3)
 
-        self.ax_disp.set_title("Max Displacement vs Iteration", fontsize=10)
+        self.ax_disp.set_title("Max Displacement (Mag) vs Iteration", fontsize=10)
         self.ax_disp.set_xlabel("Iteration")
-        self.ax_disp.set_ylabel("Max Disp")
+        self.ax_disp.set_ylabel("Max Disp (Mag)")
         self.ax_disp.grid(True, alpha=0.3)
 
         self.canvas = FigureCanvasTkAgg(self.fig, master=right_frame)
@@ -1246,6 +1269,9 @@ class NastranToolApp:
 
     def _update_plot(self, iterations, masses, displacements, max_disp_limit):
         """Thread-safe grafik güncelleme."""
+        direction = self.disp_dir_var.get() if hasattr(self, "disp_dir_var") else "Mag"
+        disp_label = f"Max Disp ({direction})"
+
         def _do_update():
             self.ax_mass.clear()
             self.ax_mass.set_title("Total Mass vs Iteration", fontsize=10)
@@ -1256,11 +1282,11 @@ class NastranToolApp:
             self.ax_mass.legend(fontsize=8)
 
             self.ax_disp.clear()
-            self.ax_disp.set_title("Max Displacement vs Iteration", fontsize=10)
+            self.ax_disp.set_title(f"{disp_label} vs Iteration", fontsize=10)
             self.ax_disp.set_xlabel("Iteration")
-            self.ax_disp.set_ylabel("Max Disp")
+            self.ax_disp.set_ylabel(disp_label)
             self.ax_disp.grid(True, alpha=0.3)
-            self.ax_disp.plot(iterations, displacements, "r-o", markersize=4, label="Max Disp")
+            self.ax_disp.plot(iterations, displacements, "r-o", markersize=4, label=disp_label)
             self.ax_disp.axhline(y=max_disp_limit, color="green", linestyle="--",
                                  linewidth=1.5, label=f"Limit ({max_disp_limit})")
             self.ax_disp.legend(fontsize=8)
@@ -1378,17 +1404,19 @@ class NastranToolApp:
         if not vals:
             return
         bdf_path, nastran_exe, output_dir = vals
+        disp_direction = self.disp_dir_var.get()
         self._disable_buttons()
         self.progress.configure(mode="indeterminate")
         self.progress.start(10)
         threading.Thread(
-            target=self._single_worker, args=(bdf_path, nastran_exe, output_dir), daemon=True
+            target=self._single_worker, args=(bdf_path, nastran_exe, output_dir, disp_direction), daemon=True
         ).start()
 
-    def _single_worker(self, bdf_path, nastran_exe, output_dir):
+    def _single_worker(self, bdf_path, nastran_exe, output_dir, disp_direction="Mag"):
         try:
             self._log("=" * 50)
             self._log("TEK ÇÖZÜM MODU")
+            self._log(f"  Displacement Yönü: {disp_direction}")
             self._log("=" * 50)
 
             op2_path = run_nastran(nastran_exe, bdf_path, output_dir, self._log)
@@ -1396,7 +1424,7 @@ class NastranToolApp:
             op2_model.read_op2(op2_path)
             extract_results_csv(op2_model, output_dir, "result", self._log)
 
-            max_disp = get_max_absolute_displacement(op2_model)
+            max_disp = get_max_absolute_displacement(op2_model, direction=disp_direction)
             max_vm = max(get_von_mises_stresses(op2_model).values()) if get_von_mises_stresses(op2_model) else 0.0
 
             # BDF'den mass bilgisi
@@ -1411,7 +1439,7 @@ class NastranToolApp:
                     current_t[pid] = prop.t
             total_mass, _ = compute_real_mass(current_t, pid_mid_map, mid_density_map, pid_area_map)
 
-            log_mass_summary(total_mass, max_disp, 0, max_vm, True, self._log)
+            log_mass_summary(total_mass, max_disp, 0, max_vm, True, self._log, disp_direction=disp_direction)
 
             self._log("İŞLEM TAMAMLANDI!")
             self.root.after(0, lambda: messagebox.showinfo("Başarılı", "Sonuçlar CSV olarak yazıldı!"))
@@ -1479,6 +1507,7 @@ class NastranToolApp:
         sigma_count = self.sigma_var.get() if stress_mode == "Average Stress" else 0
 
         scratch_dir = self.scratch_entry.get().strip() or None
+        disp_direction = self.disp_dir_var.get()
 
         self._disable_buttons()
         self.progress.configure(mode="determinate", value=0)
@@ -1487,14 +1516,16 @@ class NastranToolApp:
             target=self._opt_worker,
             args=(bdf_path, nastran_exe, output_dir, excel_path,
                   min_t, max_t, step, max_disp_limit, max_iter, algo_name, n_parallel, memory_mb,
-                  retain_mode, thickness_range_data, stress_mode, sigma_count, scratch_dir),
+                  retain_mode, thickness_range_data, stress_mode, sigma_count, scratch_dir,
+                  disp_direction),
             daemon=True,
         ).start()
 
     def _opt_worker(self, bdf_path, nastran_exe, output_dir, excel_path,
                     min_t, max_t, step, max_disp_limit, max_iter, algo_name, n_parallel, memory_mb,
                     retain_mode="all", thickness_range_data=None,
-                    stress_mode="Element Based", sigma_count=0, scratch_dir=None):
+                    stress_mode="Element Based", sigma_count=0, scratch_dir=None,
+                    disp_direction="Mag"):
         try:
             self._log("=" * 60)
             self._log(f"OPTİMİZASYON: {algo_name}")
@@ -1502,7 +1533,7 @@ class NastranToolApp:
                 self._log(f"  Thickness: Excel'den PID bazli (Thickness Range)")
             else:
                 self._log(f"  Min: {min_t}  Max: {max_t}  Step: {step}")
-            self._log(f"  Max Disp: {max_disp_limit}  Max Iter: {max_iter}  Paralel: {n_parallel}  Memory: {memory_mb}mb" if memory_mb > 0 else f"  Max Disp: {max_disp_limit}  Max Iter: {max_iter}  Paralel: {n_parallel}")
+            self._log(f"  Max Disp: {max_disp_limit} ({disp_direction})  Max Iter: {max_iter}  Paralel: {n_parallel}  Memory: {memory_mb}mb" if memory_mb > 0 else f"  Max Disp: {max_disp_limit} ({disp_direction})  Max Iter: {max_iter}  Paralel: {n_parallel}")
             if scratch_dir:
                 self._log(f"  Scratch: {scratch_dir}")
             self._log("=" * 60)
@@ -1569,7 +1600,7 @@ class NastranToolApp:
                 pid_bounds=pid_bounds,
                 stress_mode=stress_mode, sigma_count=sigma_count,
                 eid_pid_map=eid_pid_map, eid_area_map=eid_area_map,
-                scratch_dir=scratch_dir,
+                scratch_dir=scratch_dir, disp_direction=disp_direction,
             )
 
             if "FD" in algo_name or "SQP" in algo_name:
@@ -1606,7 +1637,8 @@ class NastranToolApp:
             total_mass, pid_mass = compute_real_mass(
                 result_t, pid_mid_map, mid_density_map, pid_area_map
             )
-            log_mass_summary(total_mass, final_disp, max_disp_limit, max_vm, stress_ok, self._log)
+            log_mass_summary(total_mass, final_disp, max_disp_limit, max_vm, stress_ok, self._log,
+                             disp_direction=disp_direction)
 
             # Kalınlık + mass CSV
             t_rows = []
@@ -1626,7 +1658,7 @@ class NastranToolApp:
             hist_df = pd.DataFrame({
                 "Iteration": tracker.iterations,
                 "Mass_kg": tracker.masses,
-                "MaxDisplacement": tracker.displacements,
+                f"MaxDisplacement_{disp_direction}": tracker.displacements,
                 "MaxVonMises": tracker.stresses,
             })
             hist_csv = os.path.join(output_dir, "iteration_history.csv")
@@ -1649,7 +1681,7 @@ class NastranToolApp:
             self.root.after(0, lambda: messagebox.showinfo(
                 "Optimizasyon Tamamlandı",
                 f"Total Mass: {total_mass:.4f} kg\n"
-                f"Max Disp: {final_disp:.4f}\n"
+                f"Max Disp ({disp_direction}): {final_disp:.4f}\n"
                 f"Max VM: {max_vm:.2f}\n\n"
                 f"Detaylar: {t_csv}"
             ))
