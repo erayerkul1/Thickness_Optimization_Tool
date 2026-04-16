@@ -605,7 +605,7 @@ def optimize_fd_sqp(bdf_path, nastran_exe, output_dir, pids, allowable_map,
                     log_callback, progress_callback, tracker, n_parallel=1, memory_mb=0,
                     pid_bounds=None, stress_mode="Element Based", sigma_count=0,
                     eid_pid_map=None, eid_area_map=None, scratch_dir=None, disp_direction="Mag",
-                    node_filter=None):
+                    node_filter=None, stop_event=None):
     """Forward Difference ile gradyan hesaplayıp SciPy trust-constr (SQP) ile optimize eder."""
     from scipy.optimize import minimize, NonlinearConstraint
 
@@ -709,6 +709,12 @@ def optimize_fd_sqp(bdf_path, nastran_exe, output_dir, pids, allowable_map,
         jac=disp_constraint_jac
     )
 
+    def _sqp_stop_cb(x, state):
+        if stop_event is not None and stop_event.is_set():
+            log_callback("  SQP durduruldu.")
+            return True
+        return False
+
     log_callback(f"  SQP optimizasyon başlıyor...")
     result = minimize(
         objective, x0, method="trust-constr",
@@ -716,6 +722,7 @@ def optimize_fd_sqp(bdf_path, nastran_exe, output_dir, pids, allowable_map,
         bounds=bounds,
         constraints=[disp_constr],
         options={"maxiter": max_iter, "verbose": 0, "gtol": float(np.min(pid_step)) / 10},
+        callback=_sqp_stop_cb,
     )
 
     log_callback(f"\n  SQP sonucu: {result.message}")
@@ -745,7 +752,7 @@ def optimize_genetic(bdf_path, nastran_exe, output_dir, pids, allowable_map,
                      pid_mid_map=None, mid_density_map=None, pid_area_map=None,
                      pid_bounds=None, stress_mode="Element Based", sigma_count=0,
                      eid_pid_map=None, eid_area_map=None, scratch_dir=None, disp_direction="Mag",
-                     node_filter=None):
+                     node_filter=None, stop_event=None):
     """Genetik Algoritma ile kalınlık optimizasyonu."""
     n = len(pids)
     eval_count = [0]
@@ -812,6 +819,9 @@ def optimize_genetic(bdf_path, nastran_exe, output_dir, pids, allowable_map,
     best_stress = {}
 
     for gen in range(n_generations):
+        if stop_event is not None and stop_event.is_set():
+            log_callback("  GA durduruldu.")
+            break
         log_callback(f"\n{'='*50}")
         log_callback(f"GA JENERASYON {gen + 1}/{n_generations}")
         progress_callback((gen / n_generations) * 100)
@@ -1138,7 +1148,8 @@ def optimize_oc_sepcmaes(bdf_path, nastran_exe, output_dir, pids, allowable_map,
                           pid_mid_map=None, mid_density_map=None, pid_area_map=None,
                           pid_bounds=None, stress_mode="Element Based", sigma_count=0,
                           eid_pid_map=None, eid_area_map=None, scratch_dir=None,
-                          disp_direction="Mag", node_filter=None, mid_E_map=None):
+                          disp_direction="Mag", node_filter=None, mid_E_map=None,
+                          stop_event=None):
     """Hibrit OC + sep-CMA-ES optimizasyon.
 
     Faz 1 — OC: strain energy sensitivitesi ile hızlı lokal yakınsama (1 run/iter).
@@ -1196,6 +1207,9 @@ def optimize_oc_sepcmaes(bdf_path, nastran_exe, output_dir, pids, allowable_map,
     oc_best_mass = float('inf')
 
     for oc_i in range(oc_iters):
+        if stop_event is not None and stop_event.is_set():
+            log_callback("  OC durduruldu.")
+            break
         progress_callback((oc_i / max_iter) * 100.0)
         work_dir = os.path.join(output_dir, f"oc_iter{oc_i + 1}")
         try:
@@ -1259,6 +1273,9 @@ def optimize_oc_sepcmaes(bdf_path, nastran_exe, output_dir, pids, allowable_map,
     cma_best_stress  = {}
 
     for cma_gen in range(cma_iters):
+        if stop_event is not None and stop_event.is_set():
+            log_callback("  CMA-ES durduruldu.")
+            break
         progress_callback(((oc_iters + cma_gen) / max_iter) * 100.0)
 
         # Örnekle ve sınırlara kırp
@@ -1369,6 +1386,345 @@ def optimize_oc_sepcmaes(bdf_path, nastran_exe, output_dir, pids, allowable_map,
 
 
 # ---------------------------------------------------------------------------
+# ALGORİTMA 4: Standalone OC  (seri koşturma için optimize, 1 run/iter)
+# ---------------------------------------------------------------------------
+
+def optimize_oc(bdf_path, nastran_exe, output_dir, pids, allowable_map,
+                min_t, max_t, step, max_disp_limit, max_iter,
+                log_callback, progress_callback, tracker, n_parallel=1, memory_mb=0,
+                pid_mid_map=None, mid_density_map=None, pid_area_map=None,
+                pid_bounds=None, stress_mode="Element Based", sigma_count=0,
+                eid_pid_map=None, eid_area_map=None, scratch_dir=None,
+                disp_direction="Mag", node_filter=None, mid_E_map=None,
+                stop_event=None):
+    """Standalone Optimality Criteria (OC) optimizasyonu.
+
+    n=200-500 PID için seri koşturmada en verimli seçim:
+    Her iterasyon yalnızca 1 Nastran çalışması gerektirir.
+    Strain energy bazlı sensitivite + lambda bisection ile kalınlık günceller.
+    Yakınsama ~30-80 iterasyonda, toplam Nastran: max_iter kadar.
+    """
+    n = len(pids)
+    if mid_E_map is None:
+        mid_E_map = {}
+
+    if pid_bounds:
+        pid_min_d  = {p: pid_bounds[p][0] for p in pids}
+        pid_max_d  = {p: pid_bounds[p][1] for p in pids}
+        pid_step_d = {p: pid_bounds[p][2] for p in pids}
+    else:
+        pid_min_d  = {p: min_t for p in pids}
+        pid_max_d  = {p: max_t for p in pids}
+        pid_step_d = {p: step  for p in pids}
+
+    pid_bounds_full = {p: (pid_min_d[p], pid_max_d[p], pid_step_d[p]) for p in pids}
+
+    log_callback(f"\n  Standalone OC — {n} PSHELL, {max_iter} iterasyon, 1 run/iter")
+    log_callback("  Strain energy sensitivitesi (OP2'den) + lambda bisection")
+
+    # Başlangıç: orta nokta
+    current_t = {p: round(float((pid_min_d[p] + pid_max_d[p]) / 2.0), 1) for p in pids}
+
+    best_t    = None
+    best_mass = float('inf')
+    best_disp = float('inf')
+    best_stress_map = {}
+
+    # Move limit: başlangıçta geniş, yakınsadıkça daralır
+    prev_mass = float('inf')
+    stagnation = 0
+
+    for it in range(max_iter):
+        if stop_event is not None and stop_event.is_set():
+            log_callback("  OC durduruldu.")
+            break
+
+        progress_callback((it / max_iter) * 100.0)
+        # Move limit azaltma: 5 iterasyon iyileşme yoksa sıkılaştır
+        move_limit = max(0.05, 0.3 * (0.95 ** stagnation))
+        work_dir = os.path.join(output_dir, f"oc_{it + 1}")
+        try:
+            max_disp, stress_map = solve_and_evaluate(
+                nastran_exe, bdf_path, current_t, work_dir, log_callback,
+                memory_mb=memory_mb, scratch_dir=scratch_dir,
+                disp_direction=disp_direction, node_filter=node_filter
+            )
+            stress_ok, _, max_vm = do_stress_check(
+                stress_map, allowable_map, stress_mode, sigma_count,
+                eid_pid_map, eid_area_map)
+            tracker.record(f"OC_{it + 1}", current_t, max_disp, max_vm, stress_ok,
+                           allowable_map, log_callback)
+
+            mass_now, _ = compute_real_mass(current_t, pid_mid_map, mid_density_map, pid_area_map)
+            log_callback(f"  OC {it+1}/{max_iter}: mass={mass_now:.4f} kg  "
+                         f"disp={'OK' if max_disp <= max_disp_limit else 'FAIL'}  "
+                         f"stress={'OK' if stress_ok else 'FAIL'}  "
+                         f"move_lim={move_limit:.3f}")
+
+            # En iyi feasible çözümü sakla
+            if max_disp <= max_disp_limit and stress_ok and mass_now < best_mass:
+                best_mass = mass_now
+                best_t = dict(current_t)
+                best_disp = max_disp
+                best_stress_map = dict(stress_map)
+
+            # Stagnation sayacı
+            if abs(mass_now - prev_mass) < 1e-4 * max(prev_mass, 1.0):
+                stagnation += 1
+            else:
+                stagnation = 0
+            prev_mass = mass_now
+
+            # OC sensitivite + güncelleme
+            sensitivities, pid_SE = compute_oc_sensitivities(
+                current_t, stress_map, pid_mid_map, mid_density_map, mid_E_map,
+                eid_pid_map, eid_area_map, pid_area_map
+            )
+            current_t = oc_update_step(
+                current_t, sensitivities, pid_SE, pid_bounds_full,
+                max_disp, max_disp_limit, move_limit=move_limit, eta=0.5
+            )
+
+        except Exception as exc:
+            log_callback(f"  [Hata] OC iterasyon {it + 1}: {exc}")
+
+    if best_t is None:
+        best_t = current_t
+
+    # Final çözüm
+    log_callback(f"\n{'='*50}")
+    log_callback("SON ÇÖZÜM")
+    final_dir = os.path.join(output_dir, "final_result")
+    final_disp, final_stress = solve_and_evaluate(
+        nastran_exe, bdf_path, best_t, final_dir, log_callback,
+        memory_mb=memory_mb, scratch_dir=scratch_dir,
+        disp_direction=disp_direction, node_filter=node_filter
+    )
+    stress_ok, _, max_vm = do_stress_check(
+        final_stress, allowable_map, stress_mode, sigma_count,
+        eid_pid_map, eid_area_map)
+    tracker.record("Final", best_t, final_disp, max_vm, stress_ok, allowable_map, log_callback)
+
+    progress_callback(100)
+    return best_t, final_disp, final_stress
+
+
+# ---------------------------------------------------------------------------
+# ALGORİTMA 5: Differential Evolution (DE)  (paralel koşturma için)
+# ---------------------------------------------------------------------------
+
+def optimize_de(bdf_path, nastran_exe, output_dir, pids, allowable_map,
+                min_t, max_t, step, max_disp_limit, max_iter,
+                log_callback, progress_callback, tracker, n_parallel=1, memory_mb=0,
+                pid_mid_map=None, mid_density_map=None, pid_area_map=None,
+                pid_bounds=None, stress_mode="Element Based", sigma_count=0,
+                eid_pid_map=None, eid_area_map=None, scratch_dir=None,
+                disp_direction="Mag", node_filter=None, stop_event=None):
+    """Differential Evolution (DE) optimizasyonu.
+
+    Paralel koşturmada GA'ya kıyasla daha iyi global arama:
+    - Küçük popülasyon (pop_size = max(n_parallel, min(50, n//4)))
+    - Strateji: current-to-best/1/bin — hızlı yakınsama + çeşitlilik
+    - Her nesil tüm popülasyon paralel değerlendirilir (1 batch/nesil)
+    - F=0.8, CR=0.9
+    """
+    n = len(pids)
+
+    if pid_bounds:
+        pid_min_d  = {p: pid_bounds[p][0] for p in pids}
+        pid_max_d  = {p: pid_bounds[p][1] for p in pids}
+        pid_step_d = {p: pid_bounds[p][2] for p in pids}
+    else:
+        pid_min_d  = {p: min_t for p in pids}
+        pid_max_d  = {p: max_t for p in pids}
+        pid_step_d = {p: step  for p in pids}
+
+    pid_min_arr  = np.array([pid_min_d[p]  for p in pids])
+    pid_max_arr  = np.array([pid_max_d[p]  for p in pids])
+    pid_step_arr = np.array([pid_step_d[p] for p in pids])
+
+    # Pop boyutu: n_parallel ile uyumlu, n'nin belirli bir fraksiyonu
+    pop_size = max(n_parallel, min(50, max(15, n // 4)))
+    F  = 0.8   # differential weight
+    CR = 0.9   # crossover rate
+
+    log_callback(f"\n  Differential Evolution — {n} PSHELL, pop={pop_size}, "
+                 f"F={F}, CR={CR}, nesil={max_iter}, paralel={n_parallel}")
+
+    def _fitness(t_map, max_disp_val, stress_ok_val):
+        mass, _ = compute_real_mass(t_map, pid_mid_map, mid_density_map, pid_area_map)
+        penalty = 0.0
+        if max_disp_val > max_disp_limit:
+            penalty += 1000.0 * (max_disp_val - max_disp_limit)
+        if not stress_ok_val:
+            penalty += 500.0
+        return mass + penalty
+
+    def _to_t_map(x):
+        clipped = np.clip(x, pid_min_arr, pid_max_arr)
+        rounded = np.round(clipped / np.maximum(pid_step_arr, 1e-10)) * pid_step_arr
+        rounded = np.round(np.clip(rounded, pid_min_arr, pid_max_arr), 1)
+        return {pids[j]: float(rounded[j]) for j in range(n)}
+
+    rng = np.random.RandomState(42)
+
+    # Latin Hypercube benzeri başlangıç popülasyonu
+    population = np.zeros((pop_size, n))
+    for j in range(n):
+        vals = np.linspace(pid_min_arr[j], pid_max_arr[j], pop_size)
+        rng.shuffle(vals)
+        population[:, j] = vals
+
+    # İlk popülasyonu değerlendir
+    log_callback(f"\n  Başlangıç popülasyonu değerlendiriliyor ({pop_size} birey)...")
+    t_maps_init = [_to_t_map(population[i]) for i in range(pop_size)]
+
+    if n_parallel > 1:
+        batch = [(t_maps_init[i], os.path.join(output_dir, f"de_init_{i}"))
+                 for i in range(pop_size)]
+        try:
+            results = solve_batch(nastran_exe, bdf_path, batch, n_parallel,
+                                  log_callback, memory_mb=memory_mb, scratch_dir=scratch_dir,
+                                  disp_direction=disp_direction, node_filter=node_filter)
+        except Exception as exc:
+            log_callback(f"  [Hata] DE başlangıç batch: {exc}")
+            results = [(t_maps_init[i], 1e10, {}) for i in range(pop_size)]
+    else:
+        results = []
+        for i in range(pop_size):
+            try:
+                md, sm = solve_and_evaluate(
+                    nastran_exe, bdf_path, t_maps_init[i],
+                    os.path.join(output_dir, f"de_init_{i}"), log_callback,
+                    memory_mb=memory_mb, scratch_dir=scratch_dir,
+                    disp_direction=disp_direction, node_filter=node_filter)
+                results.append((t_maps_init[i], md, sm))
+            except Exception as exc:
+                log_callback(f"  [Hata] DE init birey #{i}: {exc}")
+                results.append((t_maps_init[i], 1e10, {}))
+
+    fitness = np.full(pop_size, float('inf'))
+    for i, item in enumerate(results):
+        if item is None:
+            continue
+        t_map, max_disp, stress_map = item
+        try:
+            stress_ok, _, max_vm = do_stress_check(
+                stress_map, allowable_map, stress_mode, sigma_count,
+                eid_pid_map, eid_area_map)
+            fitness[i] = _fitness(t_map, max_disp, stress_ok)
+            tracker.record(f"DE_init_{i+1}", t_maps_init[i], max_disp, max_vm, stress_ok,
+                           allowable_map, log_callback)
+        except Exception as exc:
+            log_callback(f"  [Hata] DE init fitness #{i}: {exc}")
+
+    best_idx = int(np.argmin(fitness))
+    best_t_overall  = dict(t_maps_init[best_idx])
+    best_fit_overall = fitness[best_idx]
+
+    # ── Ana DE döngüsü ─────────────────────────────────────────────────────
+    for gen in range(max_iter):
+        if stop_event is not None and stop_event.is_set():
+            log_callback("  DE durduruldu.")
+            break
+
+        progress_callback((gen / max_iter) * 100.0)
+
+        best_x = population[best_idx].copy()
+
+        # Deneme vektörleri oluştur (current-to-best/1/bin)
+        trials = np.zeros_like(population)
+        for i in range(pop_size):
+            # r1, r2: i'den farklı iki rastgele birey
+            candidates = [k for k in range(pop_size) if k != i]
+            r1, r2 = rng.choice(candidates, size=2, replace=False)
+
+            mutant = (population[i]
+                      + F * (best_x - population[i])
+                      + F * (population[r1] - population[r2]))
+            mutant = np.clip(mutant, pid_min_arr, pid_max_arr)
+
+            # Binomial crossover
+            cross_mask = rng.random(n) < CR
+            cross_mask[rng.randint(0, n)] = True  # en az 1 boyut mutanttan
+            trial = np.where(cross_mask, mutant, population[i])
+            trials[i] = trial
+
+        # Deneme vektörlerini değerlendir
+        trial_t_maps = [_to_t_map(trials[i]) for i in range(pop_size)]
+
+        if n_parallel > 1:
+            batch = [(trial_t_maps[i], os.path.join(output_dir, f"de_g{gen+1}_i{i}"))
+                     for i in range(pop_size)]
+            try:
+                trial_results = solve_batch(nastran_exe, bdf_path, batch, n_parallel,
+                                            log_callback, memory_mb=memory_mb,
+                                            scratch_dir=scratch_dir,
+                                            disp_direction=disp_direction,
+                                            node_filter=node_filter)
+            except Exception as exc:
+                log_callback(f"  [Hata] DE Gen {gen+1} batch: {exc}")
+                trial_results = [(trial_t_maps[i], 1e10, {}) for i in range(pop_size)]
+        else:
+            trial_results = []
+            for i in range(pop_size):
+                try:
+                    md, sm = solve_and_evaluate(
+                        nastran_exe, bdf_path, trial_t_maps[i],
+                        os.path.join(output_dir, f"de_g{gen+1}_i{i}"), log_callback,
+                        memory_mb=memory_mb, scratch_dir=scratch_dir,
+                        disp_direction=disp_direction, node_filter=node_filter)
+                    trial_results.append((trial_t_maps[i], md, sm))
+                except Exception as exc:
+                    log_callback(f"  [Hata] DE Gen {gen+1} Birey #{i}: {exc}")
+                    trial_results.append((trial_t_maps[i], 1e10, {}))
+
+        # Seçim: trial fitness < mevcut fitness ise yer değiştir
+        for i, item in enumerate(trial_results):
+            if item is None:
+                continue
+            try:
+                t_map, max_disp, stress_map = item
+                stress_ok, _, max_vm = do_stress_check(
+                    stress_map, allowable_map, stress_mode, sigma_count,
+                    eid_pid_map, eid_area_map)
+                trial_fit = _fitness(trial_t_maps[i], max_disp, stress_ok)
+                tracker.record(f"DE_G{gen+1}_{i+1}", trial_t_maps[i], max_disp, max_vm,
+                               stress_ok, allowable_map, log_callback)
+
+                if trial_fit <= fitness[i]:
+                    population[i] = trials[i]
+                    fitness[i] = trial_fit
+
+                if trial_fit < best_fit_overall:
+                    best_fit_overall = trial_fit
+                    best_t_overall = dict(trial_t_maps[i])
+            except Exception as exc:
+                log_callback(f"  [Hata] DE Gen {gen+1} seçim #{i}: {exc}")
+
+        best_idx = int(np.argmin(fitness))
+        log_callback(f"  DE Gen {gen+1}/{max_iter}: best_fit={fitness[best_idx]:.4f}")
+
+    # Final çözüm
+    log_callback(f"\n{'='*50}")
+    log_callback("SON ÇÖZÜM")
+    final_dir = os.path.join(output_dir, "final_result")
+    final_disp, final_stress = solve_and_evaluate(
+        nastran_exe, bdf_path, best_t_overall, final_dir, log_callback,
+        memory_mb=memory_mb, scratch_dir=scratch_dir,
+        disp_direction=disp_direction, node_filter=node_filter
+    )
+    stress_ok, _, max_vm = do_stress_check(
+        final_stress, allowable_map, stress_mode, sigma_count,
+        eid_pid_map, eid_area_map)
+    tracker.record("Final", best_t_overall, final_disp, max_vm, stress_ok,
+                   allowable_map, log_callback)
+
+    progress_callback(100)
+    return best_t_overall, final_disp, final_stress
+
+
+# ---------------------------------------------------------------------------
 # Çıktı dosyası temizleme (saklama moduna göre)
 # ---------------------------------------------------------------------------
 
@@ -1466,6 +1822,7 @@ class NastranToolApp:
         self.thickness_range_data = None
         self.use_node_filter = False
         self.node_filter_data = None
+        self._stop_event = threading.Event()
         self._build_ui()
 
     def _build_ui(self):
@@ -1602,9 +1959,11 @@ class NastranToolApp:
         self.algo_var = tk.StringVar()
         algo_combo = ttk.Combobox(param_frame, textvariable=self.algo_var, state="readonly", width=32)
         algo_combo["values"] = (
-            "FD + SQP (Forward Difference)",
-            "Genetic Algorithm (GA)",
             "OC + sep-CMA-ES (Hibrit)",
+            "OC Standalone (Seri, Hızlı)",
+            "Differential Evolution (DE)",
+            "Genetic Algorithm (GA)",
+            "FD + SQP (Forward Difference)",
         )
         algo_combo.current(0)
         algo_combo.grid(row=3, column=1, columnspan=4, sticky=tk.W, padx=2, pady=(4, 0))
@@ -1660,6 +2019,9 @@ class NastranToolApp:
 
         self.single_btn = ttk.Button(btn_frame, text="Tek Çözüm", command=self._on_single_run)
         self.single_btn.pack(side=tk.LEFT, padx=6)
+
+        self.stop_btn = ttk.Button(btn_frame, text="Durdur", command=self._on_stop, state=tk.DISABLED)
+        self.stop_btn.pack(side=tk.LEFT, padx=6)
 
         # İlerleme
         row += 1
@@ -1850,28 +2212,36 @@ class NastranToolApp:
 
         # Algoritma bazlı tahmini run hesabı
         if "FD" in algo_name or "SQP" in algo_name:
-            # Her iterasyonda: 1 ref + n_pids FD pertürbasyon
-            # gtol=step/10: küçük step -> daha hassas -> daha çok iter
-            # Ancak optimizer max_iter'den fazla çalışmaz
             total_run = (1 + n_pids) * max_iter + 1
             detail = (f"({1 + n_pids}) x {max_iter} iter + 1 final"
                       f"  [gtol={step/10:.4f}, cache ile daha az olabilir]")
 
-        elif "Genetic" in algo_name or "GA" in algo_name:
-            # pop_size * n_generations + 1 final
-            # step sadece yuvarlama için kullanılır, run sayısını değiştirmez
+        elif "Standalone" in algo_name:
+            total_run = max_iter + 1
+            detail = f"{max_iter} OC iter (1 run/iter) + 1 final  ← seri için en verimli"
+
+        elif "Differential" in algo_name or "DE" in algo_name:
+            de_pop = max(n_parallel, min(50, max(15, n_pids // 4)))
+            init_rounds = max(1, -(-de_pop // max(n_parallel, 1)))
+            gen_rounds  = max(1, -(-de_pop // max(n_parallel, 1)))
+            total_run = de_pop + de_pop * max_iter + 1  # init + gens + final
+            detail = (f"Init: {de_pop} birey + "
+                      f"{max_iter} nesil x {de_pop} birey + 1 final  "
+                      f"[{init_rounds + gen_rounds * max_iter} paralel tur]")
+
+        elif "GA" in algo_name or "Genetic" in algo_name:
             pop_size = max(10, 2 * n_pids)
             total_run = pop_size * max_iter + 1
-            detail = f"{pop_size} pop x {max_iter} gen + 1 final  [step={step} yuvarlama]"
+            detail = f"{pop_size} pop x {max_iter} gen + 1 final"
 
         elif "OC" in algo_name or "CMA" in algo_name:
             oc_iters_est  = max(10, min(30, max_iter // 3))
             cma_iters_est = max(1, max_iter - oc_iters_est)
             cma_pop       = max(n_parallel, 4 + int(3 * np.log(max(n_pids, 2))))
-            rounds_per_gen = max(1, -(-cma_pop // max(n_parallel, 1)))  # ceiling division
+            rounds_per_gen = max(1, -(-cma_pop // max(n_parallel, 1)))
             total_run = oc_iters_est + cma_iters_est * rounds_per_gen + 1
             detail = (f"OC: {oc_iters_est} run + "
-                      f"CMA: {cma_iters_est} nesil x ⌈{cma_pop}/{n_parallel}⌉={rounds_per_gen} tur + 1 final")
+                      f"CMA: {cma_iters_est} nesil x {rounds_per_gen} tur + 1 final")
 
         else:
             total_run = max_iter + 1
@@ -1902,14 +2272,22 @@ class NastranToolApp:
         return bdf_path, nastran_exe, output_dir
 
     def _disable_buttons(self):
+        self._stop_event.clear()
         self.run_btn.configure(state=tk.DISABLED)
         self.single_btn.configure(state=tk.DISABLED)
+        self.stop_btn.configure(state=tk.NORMAL)
 
     def _finish(self):
         self.progress.stop()
         self.progress.configure(mode="determinate", value=0)
         self.run_btn.configure(state=tk.NORMAL)
         self.single_btn.configure(state=tk.NORMAL)
+        self.stop_btn.configure(state=tk.DISABLED)
+
+    def _on_stop(self):
+        self._stop_event.set()
+        self.stop_btn.configure(state=tk.DISABLED)
+        self._log("\n⚠  Durdurma isteği alındı — mevcut Nastran çalışması bitince durulacak...")
 
     def _on_single_run(self):
         vals = self._validate_common()
@@ -2124,20 +2502,30 @@ class NastranToolApp:
                 eid_pid_map=eid_pid_map, eid_area_map=eid_area_map,
                 scratch_dir=scratch_dir, disp_direction=disp_direction,
                 node_filter=node_filter,
+                stop_event=self._stop_event,
             )
+
+            _mass_kwargs = dict(pid_mid_map=pid_mid_map,
+                                mid_density_map=mid_density_map,
+                                pid_area_map=pid_area_map)
 
             if "FD" in algo_name or "SQP" in algo_name:
                 result_t, final_disp, final_stress = optimize_fd_sqp(**algo_kwargs)
+
+            elif "Standalone" in algo_name:
+                algo_kwargs.update(_mass_kwargs, mid_E_map=mid_E_map)
+                result_t, final_disp, final_stress = optimize_oc(**algo_kwargs)
+
+            elif "Differential" in algo_name or "DE" in algo_name:
+                algo_kwargs.update(_mass_kwargs)
+                result_t, final_disp, final_stress = optimize_de(**algo_kwargs)
+
             elif "OC" in algo_name or "CMA" in algo_name:
-                algo_kwargs["pid_mid_map"]     = pid_mid_map
-                algo_kwargs["mid_density_map"] = mid_density_map
-                algo_kwargs["pid_area_map"]    = pid_area_map
-                algo_kwargs["mid_E_map"]       = mid_E_map
+                algo_kwargs.update(_mass_kwargs, mid_E_map=mid_E_map)
                 result_t, final_disp, final_stress = optimize_oc_sepcmaes(**algo_kwargs)
-            else:
-                algo_kwargs["pid_mid_map"]     = pid_mid_map
-                algo_kwargs["mid_density_map"] = mid_density_map
-                algo_kwargs["pid_area_map"]    = pid_area_map
+
+            else:  # GA
+                algo_kwargs.update(_mass_kwargs)
                 result_t, final_disp, final_stress = optimize_genetic(**algo_kwargs)
 
             # Tüm iterasyonları tara: displacement + stress kısıtını sağlayan en hafif çözüm
