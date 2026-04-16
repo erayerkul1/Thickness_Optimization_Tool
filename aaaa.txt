@@ -547,6 +547,8 @@ class IterationTracker:
         self.masses = []
         self.displacements = []
         self.stresses = []
+        self.thickness_maps = []
+        self.stress_ok_list = []
 
     def record(self, iteration_label, thickness_map, max_disp, max_vm, stress_ok,
                allowable_map, log_callback):
@@ -559,6 +561,8 @@ class IterationTracker:
         self.masses.append(total_mass)
         self.displacements.append(max_disp)
         self.stresses.append(max_vm)
+        self.thickness_maps.append(dict(thickness_map))
+        self.stress_ok_list.append(stress_ok)
 
         log_mass_summary(total_mass, max_disp, self.max_disp_limit, max_vm, stress_ok, log_callback)
 
@@ -566,6 +570,19 @@ class IterationTracker:
         self.plot_callback(self.iterations, self.masses, self.displacements, self.max_disp_limit)
 
         return total_mass
+
+    def get_best_feasible(self, max_disp_limit):
+        """Tüm iterasyonlar içinde displacement ve stress kısıtlarını sağlayan
+        en düşük kütleli thickness_map'i döndürür. Yoksa (None, inf) döner."""
+        best_mass = float('inf')
+        best_t = None
+        for i in range(len(self.iterations)):
+            if (self.displacements[i] <= max_disp_limit and
+                    self.stress_ok_list[i] and
+                    self.masses[i] < best_mass):
+                best_mass = self.masses[i]
+                best_t = self.thickness_maps[i]
+        return best_t, best_mass
 
 
 # ---------------------------------------------------------------------------
@@ -600,11 +617,11 @@ def optimize_fd_sqp(bdf_path, nastran_exe, output_dir, pids, allowable_map,
 
     def _eval_point(x, label_prefix="fd"):
         """Bir noktayı çözer, cache'e bakar."""
-        key = tuple(round(v, 8) for v in x)
+        key = tuple(round(v, 1) for v in x)
         if key in cache:
             return cache[key]
         eval_count[0] += 1
-        t_map = {pid: float(x[i]) for i, pid in enumerate(pids)}
+        t_map = {pid: round(float(x[i]), 1) for i, pid in enumerate(pids)}
         work_dir = os.path.join(output_dir, f"{label_prefix}_eval{eval_count[0]}")
         try:
             max_disp, stress_map = solve_and_evaluate(
@@ -691,7 +708,7 @@ def optimize_fd_sqp(bdf_path, nastran_exe, output_dir, pids, allowable_map,
     )
 
     log_callback(f"\n  SQP sonucu: {result.message}")
-    final_t = {pid: round(float(result.x[i]), 8) for i, pid in enumerate(pids)}
+    final_t = {pid: round(float(result.x[i]), 1) for i, pid in enumerate(pids)}
 
     final_dir = os.path.join(output_dir, "final_result")
     final_disp, final_stress = solve_and_evaluate(
@@ -799,7 +816,7 @@ def optimize_genetic(bdf_path, nastran_exe, output_dir, pids, allowable_map,
 
         # Her birey için t_map oluştur
         for i in range(pop_size):
-            t_maps[i] = {pid: round(float(population[i, j]), 8) for j, pid in enumerate(pids)}
+            t_maps[i] = {pid: round(float(population[i, j]), 1) for j, pid in enumerate(pids)}
 
         if n_parallel > 1:
             # Paralel değerlendirme
@@ -922,7 +939,7 @@ def optimize_genetic(bdf_path, nastran_exe, output_dir, pids, allowable_map,
         population = new_population
 
     if best_t is None:
-        best_t = {pid: round(float(population[0, j]), 8) for j, pid in enumerate(pids)}
+        best_t = {pid: round(float(population[0, j]), 1) for j, pid in enumerate(pids)}
 
     log_callback(f"\n{'='*50}")
     log_callback("SON ÇÖZÜM")
@@ -1695,6 +1712,27 @@ class NastranToolApp:
                 algo_kwargs["mid_density_map"] = mid_density_map
                 algo_kwargs["pid_area_map"] = pid_area_map
                 result_t, final_disp, final_stress = optimize_genetic(**algo_kwargs)
+
+            # Tüm iterasyonları tara: displacement + stress kısıtını sağlayan en hafif çözüm
+            best_feasible_t, best_feasible_mass = tracker.get_best_feasible(max_disp_limit)
+            if best_feasible_t is not None:
+                current_final_mass, _ = compute_real_mass(
+                    result_t, tracker.pid_mid_map, tracker.mid_density_map, tracker.pid_area_map
+                )
+                if best_feasible_mass < current_final_mass:
+                    self._log(f"\n  En iyi uygun iterasyon algoritmadan daha hafif:")
+                    self._log(f"    Algoritma sonucu: {current_final_mass:.6f} kg")
+                    self._log(f"    En hafif feasible: {best_feasible_mass:.6f} kg")
+                    self._log(f"  Yeniden çözülüyor...")
+                    best_dir = os.path.join(output_dir, "best_feasible_result")
+                    best_disp2, best_stress2 = solve_and_evaluate(
+                        nastran_exe, bdf_path, best_feasible_t, best_dir, self._log,
+                        memory_mb=memory_mb, scratch_dir=scratch_dir,
+                        disp_direction=disp_direction, node_filter=node_filter
+                    )
+                    result_t = best_feasible_t
+                    final_disp = best_disp2
+                    final_stress = best_stress2
 
             # Sonuç raporu
             self._log(f"\n{'='*60}")
