@@ -255,22 +255,35 @@ def get_von_mises_stresses(op2_model):
     return stress_map
 
 
-def get_max_absolute_displacement(op2_model, direction="Mag"):
+def get_max_absolute_displacement(op2_model, direction="Mag", node_filter=None):
     """OP2 modelinden maksimum displacement değerini okur.
     direction: 'Mag' (büyüklük), 'X' (T1), 'Y' (T2), 'Z' (T3)
+    node_filter: set of int node IDs; sadece bu nodelar dikkate alınır.
+                 None ise tüm nodelar kullanılır.
     """
     _dir_idx = {"X": 0, "Y": 1, "Z": 2}
     max_disp = 0.0
     if not op2_model.displacements:
         return 0.0
     for subcase_id, disp_obj in op2_model.displacements.items():
+        node_ids = disp_obj.node_gridtype[:, 0]
+
+        if node_filter is not None:
+            mask = np.isin(node_ids, list(node_filter))
+            if not np.any(mask):
+                continue
+        else:
+            mask = np.ones(len(node_ids), dtype=bool)
+
         if direction == "Mag":
             translations = disp_obj.data[:, :, :3]
             values = np.sqrt(np.sum(translations ** 2, axis=2))
         else:
             idx = _dir_idx[direction]
             values = np.abs(disp_obj.data[:, :, idx])
-        current_max = float(np.max(values))
+
+        filtered_values = values[:, mask]
+        current_max = float(np.max(filtered_values))
         if current_max > max_disp:
             max_disp = current_max
     return max_disp
@@ -327,6 +340,23 @@ def load_thickness_range_excel(excel_path):
         step = float(row[df.columns[3]])
         result[pid] = (tmin, tmax, step)
     return result
+
+
+def load_displacement_nodes_excel(excel_path, sheet_name="Displacement"):
+    """Excel'deki Displacement sayfasından Node ID listesini okur.
+    Sayfa; 'Node ID' başlıklı A sütununda node ID'leri içermelidir.
+    Returns: set of int node IDs, or None if sheet is empty or doesn't exist.
+    """
+    try:
+        df = pd.read_excel(excel_path, sheet_name=sheet_name)
+        df.columns = [c.strip() for c in df.columns]
+        id_col = df.columns[0]
+        node_ids = df[id_col].dropna()
+        if node_ids.empty:
+            return None
+        return set(int(nid) for nid in node_ids)
+    except Exception:
+        return None
 
 
 def check_stress_constraints(stress_map, allowable_map):
@@ -430,7 +460,7 @@ def log_mass_summary(total_mass, max_disp, max_disp_limit, max_vm, stress_ok, lo
 
 
 def solve_and_evaluate(nastran_exe, bdf_path, thickness_map, work_dir, log_callback, memory_mb=0, scratch_dir=None,
-                       disp_direction="Mag"):
+                       disp_direction="Mag", node_filter=None):
     """BDF'yi değiştir, çöz, sonuçları oku, CSV yaz, OP2 ve büyük dosyaları sil."""
     os.makedirs(work_dir, exist_ok=True)
     bdf_basename = os.path.basename(bdf_path)
@@ -441,7 +471,7 @@ def solve_and_evaluate(nastran_exe, bdf_path, thickness_map, work_dir, log_callb
     op2_model = OP2()
     op2_model.read_op2(op2_path)
 
-    max_disp = get_max_absolute_displacement(op2_model, direction=disp_direction)
+    max_disp = get_max_absolute_displacement(op2_model, direction=disp_direction, node_filter=node_filter)
     stress_map = get_von_mises_stresses(op2_model)
 
     iter_label = os.path.basename(work_dir)
@@ -471,7 +501,7 @@ def cleanup_nastran_outputs(work_dir, log_callback):
 
 
 def solve_batch(nastran_exe, bdf_path, batch_items, n_parallel, log_callback, memory_mb=0, scratch_dir=None,
-                disp_direction="Mag"):
+                disp_direction="Mag", node_filter=None):
     """
     Birden fazla thickness kombinasyonunu paralel olarak çözer.
     batch_items: [(thickness_map, work_dir), ...]
@@ -482,7 +512,7 @@ def solve_batch(nastran_exe, bdf_path, batch_items, n_parallel, log_callback, me
     def _solve_one(idx, thickness_map, work_dir):
         max_disp, stress_map = solve_and_evaluate(
             nastran_exe, bdf_path, thickness_map, work_dir, log_callback, memory_mb=memory_mb,
-            scratch_dir=scratch_dir, disp_direction=disp_direction
+            scratch_dir=scratch_dir, disp_direction=disp_direction, node_filter=node_filter
         )
         return idx, thickness_map, max_disp, stress_map
 
@@ -546,7 +576,8 @@ def optimize_fd_sqp(bdf_path, nastran_exe, output_dir, pids, allowable_map,
                     min_t, max_t, step, max_disp_limit, max_iter,
                     log_callback, progress_callback, tracker, n_parallel=1, memory_mb=0,
                     pid_bounds=None, stress_mode="Element Based", sigma_count=0,
-                    eid_pid_map=None, eid_area_map=None, scratch_dir=None, disp_direction="Mag"):
+                    eid_pid_map=None, eid_area_map=None, scratch_dir=None, disp_direction="Mag",
+                    node_filter=None):
     """Forward Difference ile gradyan hesaplayıp SciPy trust-constr (SQP) ile optimize eder."""
     from scipy.optimize import minimize, NonlinearConstraint
 
@@ -578,7 +609,7 @@ def optimize_fd_sqp(bdf_path, nastran_exe, output_dir, pids, allowable_map,
         try:
             max_disp, stress_map = solve_and_evaluate(
                 nastran_exe, bdf_path, t_map, work_dir, log_callback, memory_mb=memory_mb,
-                scratch_dir=scratch_dir, disp_direction=disp_direction
+                scratch_dir=scratch_dir, disp_direction=disp_direction, node_filter=node_filter
             )
             stress_ok, _, max_vm = do_stress_check(
                 stress_map, allowable_map, stress_mode, sigma_count,
@@ -624,7 +655,7 @@ def optimize_fd_sqp(bdf_path, nastran_exe, output_dir, pids, allowable_map,
                 w_dir = os.path.join(output_dir, f"fd_grad_{eval_count[0]}_p{i}")
                 batch_items.append((t_map, w_dir))
 
-            batch_results = solve_batch(nastran_exe, bdf_path, batch_items, n_parallel, log_callback, memory_mb=memory_mb, scratch_dir=scratch_dir, disp_direction=disp_direction)
+            batch_results = solve_batch(nastran_exe, bdf_path, batch_items, n_parallel, log_callback, memory_mb=memory_mb, scratch_dir=scratch_dir, disp_direction=disp_direction, node_filter=node_filter)
             grad = np.zeros(n)
             for i, (_, pert_disp, _) in enumerate(batch_results):
                 grad[i] = (pert_disp - f0) / pid_step[i]
@@ -665,7 +696,7 @@ def optimize_fd_sqp(bdf_path, nastran_exe, output_dir, pids, allowable_map,
     final_dir = os.path.join(output_dir, "final_result")
     final_disp, final_stress = solve_and_evaluate(
         nastran_exe, bdf_path, final_t, final_dir, log_callback, memory_mb=memory_mb,
-        scratch_dir=scratch_dir, disp_direction=disp_direction
+        scratch_dir=scratch_dir, disp_direction=disp_direction, node_filter=node_filter
     )
     stress_ok, _, max_vm = do_stress_check(
         final_stress, allowable_map, stress_mode, sigma_count,
@@ -685,7 +716,8 @@ def optimize_genetic(bdf_path, nastran_exe, output_dir, pids, allowable_map,
                      log_callback, progress_callback, tracker, n_parallel=1, memory_mb=0,
                      pid_mid_map=None, mid_density_map=None, pid_area_map=None,
                      pid_bounds=None, stress_mode="Element Based", sigma_count=0,
-                     eid_pid_map=None, eid_area_map=None, scratch_dir=None, disp_direction="Mag"):
+                     eid_pid_map=None, eid_area_map=None, scratch_dir=None, disp_direction="Mag",
+                     node_filter=None):
     """Genetik Algoritma ile kalınlık optimizasyonu."""
     n = len(pids)
     eval_count = [0]
@@ -778,7 +810,7 @@ def optimize_genetic(bdf_path, nastran_exe, output_dir, pids, allowable_map,
 
             log_callback(f"  {pop_size} birey paralel değerlendiriliyor...")
             try:
-                batch_results = solve_batch(nastran_exe, bdf_path, batch_items, n_parallel, log_callback, memory_mb=memory_mb, scratch_dir=scratch_dir, disp_direction=disp_direction)
+                batch_results = solve_batch(nastran_exe, bdf_path, batch_items, n_parallel, log_callback, memory_mb=memory_mb, scratch_dir=scratch_dir, disp_direction=disp_direction, node_filter=node_filter)
                 for i, (t_map, max_disp, stress_map) in enumerate(batch_results):
                     stress_ok, _, max_vm = do_stress_check(
                         stress_map, allowable_map, stress_mode, sigma_count,
@@ -803,7 +835,7 @@ def optimize_genetic(bdf_path, nastran_exe, output_dir, pids, allowable_map,
                 try:
                     max_disp, stress_map = solve_and_evaluate(
                         nastran_exe, bdf_path, t_maps[i], w_dir, log_callback, memory_mb=memory_mb,
-                        scratch_dir=scratch_dir, disp_direction=disp_direction
+                        scratch_dir=scratch_dir, disp_direction=disp_direction, node_filter=node_filter
                     )
                     stress_ok, _, max_vm = do_stress_check(
                         stress_map, allowable_map, stress_mode, sigma_count,
@@ -897,7 +929,7 @@ def optimize_genetic(bdf_path, nastran_exe, output_dir, pids, allowable_map,
     final_dir = os.path.join(output_dir, "final_result")
     final_disp, final_stress = solve_and_evaluate(
         nastran_exe, bdf_path, best_t, final_dir, log_callback, memory_mb=memory_mb,
-        scratch_dir=scratch_dir, disp_direction=disp_direction
+        scratch_dir=scratch_dir, disp_direction=disp_direction, node_filter=node_filter
     )
     stress_ok, _, max_vm = do_stress_check(
         final_stress, allowable_map, stress_mode, sigma_count,
@@ -1004,6 +1036,8 @@ class NastranToolApp:
         self.root.resizable(True, True)
         self.use_excel_thickness = False
         self.thickness_range_data = None
+        self.use_node_filter = False
+        self.node_filter_data = None
         self._build_ui()
 
     def _build_ui(self):
@@ -1060,6 +1094,16 @@ class NastranToolApp:
             self.excel_entry, "Stress Allowable Excel Seçiniz",
             [("Excel Dosyaları", "*.xlsx *.xls"), ("Tüm Dosyalar", "*.*")]
         )).grid(row=row, column=3)
+
+        row += 1
+        ttk.Label(main_frame, text="Node Filtresi:").grid(row=row, column=0, sticky=tk.W, pady=2)
+        self.node_filter_label = ttk.Label(main_frame, text="Devre Dışı", foreground="gray")
+        self.node_filter_label.grid(row=row, column=1, sticky=tk.W, padx=4)
+        self.node_filter_btn = ttk.Button(
+            main_frame, text="Excel'den Node Oku",
+            command=self._toggle_node_filter
+        )
+        self.node_filter_btn.grid(row=row, column=2, sticky=tk.W, padx=4)
 
         row += 1
         ttk.Separator(main_frame, orient=tk.HORIZONTAL).grid(
@@ -1267,6 +1311,36 @@ class NastranToolApp:
             self.excel_thickness_btn.configure(text="Excel'den T Oku")
             self._log("  Manuel thickness parametrelerine geri donuldu.")
 
+    def _toggle_node_filter(self):
+        """Excel'deki 'Displacement' sayfasından node filtresi yükler/kaldırır."""
+        excel_path = self.excel_entry.get().strip()
+        if not excel_path or not os.path.isfile(excel_path):
+            messagebox.showerror("Hata", "Öncelikle Allowable Excel dosyasını seçiniz.")
+            return
+
+        if not self.use_node_filter:
+            node_ids = load_displacement_nodes_excel(excel_path)
+            if not node_ids:
+                messagebox.showerror(
+                    "Hata",
+                    "Excel'de 'Displacement' sayfası bulunamadı veya Node ID listesi boş.\n"
+                    "Sayfanın adı 'Displacement' olmalı ve A sütununda Node ID'ler bulunmalıdır."
+                )
+                return
+            self.node_filter_data = node_ids
+            self.use_node_filter = True
+            self.node_filter_btn.configure(text="Node Filtresini Kaldır")
+            self.node_filter_label.configure(
+                text=f"{len(node_ids)} node yüklendi", foreground="green"
+            )
+            self._log(f"  Node filtresi aktif: {len(node_ids)} node yüklendi.")
+        else:
+            self.use_node_filter = False
+            self.node_filter_data = None
+            self.node_filter_btn.configure(text="Excel'den Node Oku")
+            self.node_filter_label.configure(text="Devre Dışı", foreground="gray")
+            self._log("  Node filtresi kaldırıldı (tüm nodelar kullanılacak).")
+
     def _update_plot(self, iterations, masses, displacements, max_disp_limit):
         """Thread-safe grafik güncelleme."""
         direction = self.disp_dir_var.get() if hasattr(self, "disp_dir_var") else "Mag"
@@ -1405,18 +1479,23 @@ class NastranToolApp:
             return
         bdf_path, nastran_exe, output_dir = vals
         disp_direction = self.disp_dir_var.get()
+        node_filter = self.node_filter_data if self.use_node_filter else None
         self._disable_buttons()
         self.progress.configure(mode="indeterminate")
         self.progress.start(10)
         threading.Thread(
-            target=self._single_worker, args=(bdf_path, nastran_exe, output_dir, disp_direction), daemon=True
+            target=self._single_worker,
+            args=(bdf_path, nastran_exe, output_dir, disp_direction, node_filter),
+            daemon=True
         ).start()
 
-    def _single_worker(self, bdf_path, nastran_exe, output_dir, disp_direction="Mag"):
+    def _single_worker(self, bdf_path, nastran_exe, output_dir, disp_direction="Mag", node_filter=None):
         try:
             self._log("=" * 50)
             self._log("TEK ÇÖZÜM MODU")
             self._log(f"  Displacement Yönü: {disp_direction}")
+            if node_filter is not None:
+                self._log(f"  Node Filtresi: {len(node_filter)} node")
             self._log("=" * 50)
 
             op2_path = run_nastran(nastran_exe, bdf_path, output_dir, self._log)
@@ -1424,7 +1503,7 @@ class NastranToolApp:
             op2_model.read_op2(op2_path)
             extract_results_csv(op2_model, output_dir, "result", self._log)
 
-            max_disp = get_max_absolute_displacement(op2_model, direction=disp_direction)
+            max_disp = get_max_absolute_displacement(op2_model, direction=disp_direction, node_filter=node_filter)
             max_vm = max(get_von_mises_stresses(op2_model).values()) if get_von_mises_stresses(op2_model) else 0.0
 
             # BDF'den mass bilgisi
@@ -1508,6 +1587,7 @@ class NastranToolApp:
 
         scratch_dir = self.scratch_entry.get().strip() or None
         disp_direction = self.disp_dir_var.get()
+        node_filter = self.node_filter_data if self.use_node_filter else None
 
         self._disable_buttons()
         self.progress.configure(mode="determinate", value=0)
@@ -1517,7 +1597,7 @@ class NastranToolApp:
             args=(bdf_path, nastran_exe, output_dir, excel_path,
                   min_t, max_t, step, max_disp_limit, max_iter, algo_name, n_parallel, memory_mb,
                   retain_mode, thickness_range_data, stress_mode, sigma_count, scratch_dir,
-                  disp_direction),
+                  disp_direction, node_filter),
             daemon=True,
         ).start()
 
@@ -1525,7 +1605,7 @@ class NastranToolApp:
                     min_t, max_t, step, max_disp_limit, max_iter, algo_name, n_parallel, memory_mb,
                     retain_mode="all", thickness_range_data=None,
                     stress_mode="Element Based", sigma_count=0, scratch_dir=None,
-                    disp_direction="Mag"):
+                    disp_direction="Mag", node_filter=None):
         try:
             self._log("=" * 60)
             self._log(f"OPTİMİZASYON: {algo_name}")
@@ -1536,6 +1616,10 @@ class NastranToolApp:
             self._log(f"  Max Disp: {max_disp_limit} ({disp_direction})  Max Iter: {max_iter}  Paralel: {n_parallel}  Memory: {memory_mb}mb" if memory_mb > 0 else f"  Max Disp: {max_disp_limit} ({disp_direction})  Max Iter: {max_iter}  Paralel: {n_parallel}")
             if scratch_dir:
                 self._log(f"  Scratch: {scratch_dir}")
+            if node_filter is not None:
+                self._log(f"  Node Filtresi: {len(node_filter)} node (Displacement sayfasından)")
+            else:
+                self._log(f"  Node Filtresi: Devre Dışı (tüm nodelar)")
             self._log("=" * 60)
 
             # BDF'den PSHELL, malzeme ve alan bilgisi oku
@@ -1601,6 +1685,7 @@ class NastranToolApp:
                 stress_mode=stress_mode, sigma_count=sigma_count,
                 eid_pid_map=eid_pid_map, eid_area_map=eid_area_map,
                 scratch_dir=scratch_dir, disp_direction=disp_direction,
+                node_filter=node_filter,
             )
 
             if "FD" in algo_name or "SQP" in algo_name:
