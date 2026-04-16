@@ -510,20 +510,28 @@ def solve_batch(nastran_exe, bdf_path, batch_items, n_parallel, log_callback, me
     results = [None] * len(batch_items)
 
     def _solve_one(idx, thickness_map, work_dir):
-        max_disp, stress_map = solve_and_evaluate(
-            nastran_exe, bdf_path, thickness_map, work_dir, log_callback, memory_mb=memory_mb,
-            scratch_dir=scratch_dir, disp_direction=disp_direction, node_filter=node_filter
-        )
-        return idx, thickness_map, max_disp, stress_map
+        try:
+            max_disp, stress_map = solve_and_evaluate(
+                nastran_exe, bdf_path, thickness_map, work_dir, log_callback, memory_mb=memory_mb,
+                scratch_dir=scratch_dir, disp_direction=disp_direction, node_filter=node_filter
+            )
+            return idx, thickness_map, max_disp, stress_map
+        except Exception as exc:
+            log_callback(f"  [Hata] İterasyon '{os.path.basename(work_dir)}': {exc}")
+            return idx, thickness_map, 1e10, {}
 
     with ThreadPoolExecutor(max_workers=n_parallel) as executor:
-        futures = []
-        for idx, (t_map, w_dir) in enumerate(batch_items):
-            futures.append(executor.submit(_solve_one, idx, t_map, w_dir))
+        futures = {executor.submit(_solve_one, idx, t_map, w_dir): idx
+                   for idx, (t_map, w_dir) in enumerate(batch_items)}
 
         for future in as_completed(futures):
-            idx, t_map, max_disp, stress_map = future.result()
-            results[idx] = (t_map, max_disp, stress_map)
+            try:
+                idx, t_map, max_disp, stress_map = future.result()
+                results[idx] = (t_map, max_disp, stress_map)
+            except Exception as exc:
+                idx = futures[future]
+                log_callback(f"  [Hata] Batch item #{idx} beklenmeyen thread hatası: {exc}")
+                results[idx] = (batch_items[idx][0], 1e10, {})
 
     return results
 
@@ -636,7 +644,7 @@ def optimize_fd_sqp(bdf_path, nastran_exe, output_dir, pids, allowable_map,
             cache[key] = (max_disp, stress_map)
             return max_disp, stress_map
         except Exception as exc:
-            log_callback(f"  Nastran hatası: {exc}")
+            log_callback(f"  [Hata] Eval #{eval_count[0]} ({label_prefix}): {exc}")
             cache[key] = (max_disp_limit * 10, {})
             return max_disp_limit * 10, {}
 
@@ -828,7 +836,15 @@ def optimize_genetic(bdf_path, nastran_exe, output_dir, pids, allowable_map,
             log_callback(f"  {pop_size} birey paralel değerlendiriliyor...")
             try:
                 batch_results = solve_batch(nastran_exe, bdf_path, batch_items, n_parallel, log_callback, memory_mb=memory_mb, scratch_dir=scratch_dir, disp_direction=disp_direction, node_filter=node_filter)
-                for i, (t_map, max_disp, stress_map) in enumerate(batch_results):
+            except Exception as exc:
+                log_callback(f"  [Hata] GA Gen {gen+1} batch başlatma hatası: {exc}")
+                batch_results = [(t_maps[i], 1e10, {}) for i in range(pop_size)]
+
+            for i, item in enumerate(batch_results):
+                try:
+                    if item is None:
+                        raise ValueError("Sonuç alınamadı")
+                    t_map, max_disp, stress_map = item
                     stress_ok, _, max_vm = do_stress_check(
                         stress_map, allowable_map, stress_mode, sigma_count,
                         eid_pid_map, eid_area_map)
@@ -838,12 +854,11 @@ def optimize_genetic(bdf_path, nastran_exe, output_dir, pids, allowable_map,
                     vm_results[i] = max_vm
                     mass_results[i] = _calc_mass(t_maps[i])
                     fitness_scores[i] = _fitness(t_maps[i], max_disp, stress_ok)
-
                     tracker.record(f"GA_G{gen+1}_{i+1}", t_maps[i], max_disp, max_vm, stress_ok,
                                    allowable_map, log_callback)
-            except Exception as exc:
-                log_callback(f"  Paralel GA hatası: {exc}")
-                continue
+                except Exception as exc:
+                    log_callback(f"  [Hata] GA Gen {gen+1} Birey #{i+1} işleme hatası: {exc}")
+                    fitness_scores[i] = float('inf')
         else:
             # Seri değerlendirme
             for i in range(pop_size):
@@ -858,7 +873,7 @@ def optimize_genetic(bdf_path, nastran_exe, output_dir, pids, allowable_map,
                         stress_map, allowable_map, stress_mode, sigma_count,
                         eid_pid_map, eid_area_map)
                 except Exception as exc:
-                    log_callback(f"    GA Eval hatası: {exc}")
+                    log_callback(f"  [Hata] GA Gen {gen+1} Birey #{i+1}: {exc}")
                     max_disp = max_disp_limit * 10
                     stress_ok = False
                     stress_map = {}
