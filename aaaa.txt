@@ -1510,23 +1510,24 @@ def optimize_oc(bdf_path, nastran_exe, output_dir, pids, allowable_map,
 
 
 # ---------------------------------------------------------------------------
-# ALGORİTMA 5: Differential Evolution (DE)  (paralel koşturma için)
+# ALGORİTMA 5: L-SHADE (Success-History based Adaptive DE)
 # ---------------------------------------------------------------------------
 
-def optimize_de(bdf_path, nastran_exe, output_dir, pids, allowable_map,
-                min_t, max_t, step, max_disp_limit, max_iter,
-                log_callback, progress_callback, tracker, n_parallel=1, memory_mb=0,
-                pid_mid_map=None, mid_density_map=None, pid_area_map=None,
-                pid_bounds=None, stress_mode="Element Based", sigma_count=0,
-                eid_pid_map=None, eid_area_map=None, scratch_dir=None,
-                disp_direction="Mag", node_filter=None, stop_event=None):
-    """Differential Evolution (DE) optimizasyonu.
+def optimize_lshade(bdf_path, nastran_exe, output_dir, pids, allowable_map,
+                    min_t, max_t, step, max_disp_limit, max_iter,
+                    log_callback, progress_callback, tracker, n_parallel=1, memory_mb=0,
+                    pid_mid_map=None, mid_density_map=None, pid_area_map=None,
+                    pid_bounds=None, stress_mode="Element Based", sigma_count=0,
+                    eid_pid_map=None, eid_area_map=None, scratch_dir=None,
+                    disp_direction="Mag", node_filter=None, stop_event=None):
+    """L-SHADE: Success-History based Adaptive Differential Evolution.
 
-    Paralel koşturmada GA'ya kıyasla daha iyi global arama:
-    - Küçük popülasyon (pop_size = max(n_parallel, min(50, n//4)))
-    - Strateji: current-to-best/1/bin — hızlı yakınsama + çeşitlilik
-    - Her nesil tüm popülasyon paralel değerlendirilir (1 batch/nesil)
-    - F=0.8, CR=0.9
+    Standart DE'ye göre iyileştirmeler:
+    - F ve CR adaptif: H=50 success history archive üzerinden Cauchy/Normal örnekleme
+    - Popülasyon lineer küçülür: N_init → N_min (population shrinking)
+    - Strateji: current-to-pbest/1/bin (pbest: üst p=%11'lik bireylerden)
+    - External archive: başarısız bireyler diversity için saklanır
+    - Weighted Lehmer mean ile history güncelleme
     """
     n = len(pids)
 
@@ -1543,13 +1544,17 @@ def optimize_de(bdf_path, nastran_exe, output_dir, pids, allowable_map,
     pid_max_arr  = np.array([pid_max_d[p]  for p in pids])
     pid_step_arr = np.array([pid_step_d[p] for p in pids])
 
-    # Pop boyutu: n_parallel ile uyumlu, n'nin belirli bir fraksiyonu
-    pop_size = max(n_parallel, min(50, max(15, n // 4)))
-    F  = 0.8   # differential weight
-    CR = 0.9   # crossover rate
+    H      = 50
+    p_frac = 0.11
+    N_init = max(n_parallel, min(50, max(15, n // 4)))
+    N_min  = max(4, n_parallel)
 
-    log_callback(f"\n  Differential Evolution — {n} PSHELL, pop={pop_size}, "
-                 f"F={F}, CR={CR}, nesil={max_iter}, paralel={n_parallel}")
+    M_F  = np.full(H, 0.5)
+    M_CR = np.full(H, 0.5)
+    h_idx = 0
+
+    log_callback(f"\n  L-SHADE — {n} PSHELL, N_init={N_init}→{N_min}, "
+                 f"H={H}, p={p_frac}, nesil={max_iter}, paralel={n_parallel}")
 
     def _fitness(t_map, max_disp_val, stress_ok_val):
         mass, _ = compute_real_mass(t_map, pid_mid_map, mid_density_map, pid_area_map)
@@ -1568,26 +1573,285 @@ def optimize_de(bdf_path, nastran_exe, output_dir, pids, allowable_map,
 
     rng = np.random.RandomState(42)
 
-    # Latin Hypercube benzeri başlangıç popülasyonu
-    population = np.zeros((pop_size, n))
+    # Latin Hypercube başlangıç popülasyonu
+    population = np.zeros((N_init, n))
     for j in range(n):
-        vals = np.linspace(pid_min_arr[j], pid_max_arr[j], pop_size)
+        vals = np.linspace(pid_min_arr[j], pid_max_arr[j], N_init)
         rng.shuffle(vals)
         population[:, j] = vals
 
-    # İlk popülasyonu değerlendir
-    log_callback(f"\n  Başlangıç popülasyonu değerlendiriliyor ({pop_size} birey)...")
-    t_maps_init = [_to_t_map(population[i]) for i in range(pop_size)]
+    log_callback(f"\n  Başlangıç popülasyonu değerlendiriliyor ({N_init} birey)...")
+    t_maps_cur = [_to_t_map(population[i]) for i in range(N_init)]
 
     if n_parallel > 1:
-        batch = [(t_maps_init[i], os.path.join(output_dir, f"de_init_{i}"))
+        batch = [(t_maps_cur[i], os.path.join(output_dir, f"lshade_init_{i}"))
+                 for i in range(N_init)]
+        try:
+            results = solve_batch(nastran_exe, bdf_path, batch, n_parallel,
+                                  log_callback, memory_mb=memory_mb, scratch_dir=scratch_dir,
+                                  disp_direction=disp_direction, node_filter=node_filter)
+        except Exception as exc:
+            log_callback(f"  [Hata] L-SHADE başlangıç batch: {exc}")
+            results = [(t_maps_cur[i], 1e10, {}) for i in range(N_init)]
+    else:
+        results = []
+        for i in range(N_init):
+            try:
+                md, sm = solve_and_evaluate(
+                    nastran_exe, bdf_path, t_maps_cur[i],
+                    os.path.join(output_dir, f"lshade_init_{i}"), log_callback,
+                    memory_mb=memory_mb, scratch_dir=scratch_dir,
+                    disp_direction=disp_direction, node_filter=node_filter)
+                results.append((t_maps_cur[i], md, sm))
+            except Exception as exc:
+                log_callback(f"  [Hata] L-SHADE init birey #{i}: {exc}")
+                results.append((t_maps_cur[i], 1e10, {}))
+
+    fitness = np.full(N_init, float('inf'))
+    for i, item in enumerate(results):
+        if item is None:
+            continue
+        t_map, max_disp, stress_map = item
+        try:
+            stress_ok, _, max_vm = do_stress_check(
+                stress_map, allowable_map, stress_mode, sigma_count,
+                eid_pid_map, eid_area_map)
+            fitness[i] = _fitness(t_map, max_disp, stress_ok)
+            tracker.record(f"LS_init_{i+1}", t_maps_cur[i], max_disp, max_vm,
+                           stress_ok, allowable_map, log_callback)
+        except Exception as exc:
+            log_callback(f"  [Hata] L-SHADE init fitness #{i}: {exc}")
+
+    best_idx = int(np.argmin(fitness))
+    best_t_overall   = dict(t_maps_cur[best_idx])
+    best_fit_overall = fitness[best_idx]
+    archive = []
+
+    # ── Ana L-SHADE döngüsü ─────────────────────────────────────────────────
+    for gen in range(max_iter):
+        if stop_event is not None and stop_event.is_set():
+            log_callback("  L-SHADE durduruldu.")
+            break
+
+        progress_callback((gen / max_iter) * 100.0)
+
+        # Lineer popülasyon küçültme
+        N_t = max(N_min, round(N_init - (N_init - N_min) * gen / max(max_iter - 1, 1)))
+        if N_t < len(population):
+            worst_idx = np.argsort(fitness)[::-1][:len(population) - N_t]
+            keep_mask = np.ones(len(population), dtype=bool)
+            keep_mask[worst_idx] = False
+            population  = population[keep_mask]
+            fitness     = fitness[keep_mask]
+            t_maps_cur  = [t_maps_cur[k] for k in range(len(keep_mask)) if keep_mask[k]]
+        pop_now = len(population)
+
+        n_pbest = max(2, round(p_frac * pop_now))
+        pbest_indices = np.argsort(fitness)[:n_pbest]
+
+        S_F, S_CR, S_df = [], [], []
+        trials  = np.zeros((pop_now, n))
+        F_arr   = np.zeros(pop_now)
+        CR_arr  = np.zeros(pop_now)
+
+        for i in range(pop_now):
+            r_idx = rng.randint(0, H)
+            Fi = float(np.clip(rng.standard_cauchy() * 0.1 + M_F[r_idx], 0.0, 1.0))
+            while Fi <= 0:
+                Fi = float(np.clip(rng.standard_cauchy() * 0.1 + M_F[r_idx], 0.0, 1.0))
+            CRi = float(np.clip(rng.normal(M_CR[r_idx], 0.1), 0.0, 1.0))
+            F_arr[i], CR_arr[i] = Fi, CRi
+
+            pbest_i = int(pbest_indices[rng.randint(0, n_pbest)])
+            pbest_x = population[pbest_i].copy()
+
+            cands_pop = [k for k in range(pop_now) if k != i]
+            r1 = int(rng.choice(cands_pop))
+
+            combined = list(population) + list(archive)
+            r2_opts  = [k for k in range(len(combined)) if k != i]
+            if not r2_opts:
+                r2_opts = list(range(len(combined)))
+            r2   = int(rng.choice(r2_opts))
+            x_r2 = combined[r2]
+
+            mutant = (population[i]
+                      + Fi * (pbest_x - population[i])
+                      + Fi * (population[r1] - x_r2))
+            mutant = np.clip(mutant, pid_min_arr, pid_max_arr)
+
+            cross_mask = rng.random(n) < CRi
+            cross_mask[rng.randint(0, n)] = True
+            trials[i] = np.where(cross_mask, mutant, population[i])
+
+        trial_t_maps = [_to_t_map(trials[i]) for i in range(pop_now)]
+
+        if n_parallel > 1:
+            batch = [(trial_t_maps[i], os.path.join(output_dir, f"lshade_g{gen+1}_i{i}"))
+                     for i in range(pop_now)]
+            try:
+                trial_results = solve_batch(nastran_exe, bdf_path, batch, n_parallel,
+                                            log_callback, memory_mb=memory_mb,
+                                            scratch_dir=scratch_dir,
+                                            disp_direction=disp_direction,
+                                            node_filter=node_filter)
+            except Exception as exc:
+                log_callback(f"  [Hata] L-SHADE Gen {gen+1} batch: {exc}")
+                trial_results = [(trial_t_maps[i], 1e10, {}) for i in range(pop_now)]
+        else:
+            trial_results = []
+            for i in range(pop_now):
+                try:
+                    md, sm = solve_and_evaluate(
+                        nastran_exe, bdf_path, trial_t_maps[i],
+                        os.path.join(output_dir, f"lshade_g{gen+1}_i{i}"), log_callback,
+                        memory_mb=memory_mb, scratch_dir=scratch_dir,
+                        disp_direction=disp_direction, node_filter=node_filter)
+                    trial_results.append((trial_t_maps[i], md, sm))
+                except Exception as exc:
+                    log_callback(f"  [Hata] L-SHADE Gen {gen+1} Birey #{i}: {exc}")
+                    trial_results.append((trial_t_maps[i], 1e10, {}))
+
+        for i, item in enumerate(trial_results):
+            if item is None:
+                continue
+            try:
+                t_map, max_disp, stress_map = item
+                stress_ok, _, max_vm = do_stress_check(
+                    stress_map, allowable_map, stress_mode, sigma_count,
+                    eid_pid_map, eid_area_map)
+                trial_fit = _fitness(trial_t_maps[i], max_disp, stress_ok)
+                tracker.record(f"LS_G{gen+1}_{i+1}", trial_t_maps[i], max_disp, max_vm,
+                               stress_ok, allowable_map, log_callback)
+
+                if trial_fit <= fitness[i]:
+                    archive.append(population[i].copy())
+                    if len(archive) > pop_now:
+                        archive.pop(rng.randint(0, len(archive)))
+                    df = fitness[i] - trial_fit
+                    population[i]  = trials[i]
+                    t_maps_cur[i]  = trial_t_maps[i]
+                    fitness[i]     = trial_fit
+                    S_F.append(F_arr[i])
+                    S_CR.append(CR_arr[i])
+                    S_df.append(df)
+
+                if trial_fit < best_fit_overall:
+                    best_fit_overall = trial_fit
+                    best_t_overall   = dict(trial_t_maps[i])
+            except Exception as exc:
+                log_callback(f"  [Hata] L-SHADE Gen {gen+1} seçim #{i}: {exc}")
+
+        if S_F:
+            w_arr  = np.array(S_df, dtype=float)
+            w_arr /= max(w_arr.sum(), 1e-30)
+            S_F_a  = np.array(S_F)
+            S_CR_a = np.array(S_CR)
+            M_F[h_idx]  = float(np.clip(
+                (w_arr * S_F_a**2).sum() / max((w_arr * S_F_a).sum(), 1e-30), 0.01, 1.0))
+            M_CR[h_idx] = float(np.clip((w_arr * S_CR_a).sum(), 0.0, 1.0))
+            h_idx = (h_idx + 1) % H
+
+        best_idx = int(np.argmin(fitness))
+        log_callback(f"  L-SHADE Gen {gen+1}/{max_iter}: N={pop_now}, "
+                     f"best_fit={fitness[best_idx]:.4f}, "
+                     f"M_F={M_F[(h_idx-1)%H]:.3f}, M_CR={M_CR[(h_idx-1)%H]:.3f}")
+
+    log_callback(f"\n{'='*50}")
+    log_callback("SON ÇÖZÜM")
+    final_dir = os.path.join(output_dir, "final_result")
+    final_disp, final_stress = solve_and_evaluate(
+        nastran_exe, bdf_path, best_t_overall, final_dir, log_callback,
+        memory_mb=memory_mb, scratch_dir=scratch_dir,
+        disp_direction=disp_direction, node_filter=node_filter
+    )
+    stress_ok, _, max_vm = do_stress_check(
+        final_stress, allowable_map, stress_mode, sigma_count,
+        eid_pid_map, eid_area_map)
+    tracker.record("Final", best_t_overall, final_disp, max_vm, stress_ok,
+                   allowable_map, log_callback)
+
+    progress_callback(100)
+    return best_t_overall, final_disp, final_stress
+
+
+# ---------------------------------------------------------------------------
+# ALGORİTMA 6: PSO (Particle Swarm Optimization)
+# ---------------------------------------------------------------------------
+
+def optimize_pso(bdf_path, nastran_exe, output_dir, pids, allowable_map,
+                 min_t, max_t, step, max_disp_limit, max_iter,
+                 log_callback, progress_callback, tracker, n_parallel=1, memory_mb=0,
+                 pid_mid_map=None, mid_density_map=None, pid_area_map=None,
+                 pid_bounds=None, stress_mode="Element Based", sigma_count=0,
+                 eid_pid_map=None, eid_area_map=None, scratch_dir=None,
+                 disp_direction="Mag", node_filter=None, stop_event=None):
+    """PSO (Particle Swarm Optimization).
+
+    - w=0.729, c1=c2=1.49445 (Clerc & Kennedy 2002 constriction factor)
+    - v_max = (range) * 0.2  — hız kısıtlama
+    - Her nesil tüm partiküller paralel değerlendirilir
+    """
+    n = len(pids)
+
+    if pid_bounds:
+        pid_min_d  = {p: pid_bounds[p][0] for p in pids}
+        pid_max_d  = {p: pid_bounds[p][1] for p in pids}
+        pid_step_d = {p: pid_bounds[p][2] for p in pids}
+    else:
+        pid_min_d  = {p: min_t for p in pids}
+        pid_max_d  = {p: max_t for p in pids}
+        pid_step_d = {p: step  for p in pids}
+
+    pid_min_arr  = np.array([pid_min_d[p]  for p in pids])
+    pid_max_arr  = np.array([pid_max_d[p]  for p in pids])
+    pid_step_arr = np.array([pid_step_d[p] for p in pids])
+    v_max        = (pid_max_arr - pid_min_arr) * 0.2
+
+    pop_size = max(n_parallel, min(40, max(15, n // 5)))
+    w, c1, c2 = 0.729, 1.49445, 1.49445
+
+    log_callback(f"\n  PSO — {n} PSHELL, pop={pop_size}, "
+                 f"w={w}, c1={c1}, c2={c2}, nesil={max_iter}, paralel={n_parallel}")
+
+    def _fitness(t_map, max_disp_val, stress_ok_val):
+        mass, _ = compute_real_mass(t_map, pid_mid_map, mid_density_map, pid_area_map)
+        penalty = 0.0
+        if max_disp_val > max_disp_limit:
+            penalty += 1000.0 * (max_disp_val - max_disp_limit)
+        if not stress_ok_val:
+            penalty += 500.0
+        return mass + penalty
+
+    def _to_t_map(x):
+        clipped = np.clip(x, pid_min_arr, pid_max_arr)
+        rounded = np.round(clipped / np.maximum(pid_step_arr, 1e-10)) * pid_step_arr
+        rounded = np.round(np.clip(rounded, pid_min_arr, pid_max_arr), 1)
+        return {pids[j]: float(rounded[j]) for j in range(n)}
+
+    rng = np.random.RandomState(42)
+
+    # Latin Hypercube başlangıç pozisyonları
+    positions = np.zeros((pop_size, n))
+    for j in range(n):
+        vals = np.linspace(pid_min_arr[j], pid_max_arr[j], pop_size)
+        rng.shuffle(vals)
+        positions[:, j] = vals
+
+    velocities = (rng.random((pop_size, n)) - 0.5) * v_max
+
+    log_callback(f"\n  Başlangıç sürüsü değerlendiriliyor ({pop_size} parçacık)...")
+    t_maps_init = [_to_t_map(positions[i]) for i in range(pop_size)]
+
+    if n_parallel > 1:
+        batch = [(t_maps_init[i], os.path.join(output_dir, f"pso_init_{i}"))
                  for i in range(pop_size)]
         try:
             results = solve_batch(nastran_exe, bdf_path, batch, n_parallel,
                                   log_callback, memory_mb=memory_mb, scratch_dir=scratch_dir,
                                   disp_direction=disp_direction, node_filter=node_filter)
         except Exception as exc:
-            log_callback(f"  [Hata] DE başlangıç batch: {exc}")
+            log_callback(f"  [Hata] PSO başlangıç batch: {exc}")
             results = [(t_maps_init[i], 1e10, {}) for i in range(pop_size)]
     else:
         results = []
@@ -1595,12 +1859,12 @@ def optimize_de(bdf_path, nastran_exe, output_dir, pids, allowable_map,
             try:
                 md, sm = solve_and_evaluate(
                     nastran_exe, bdf_path, t_maps_init[i],
-                    os.path.join(output_dir, f"de_init_{i}"), log_callback,
+                    os.path.join(output_dir, f"pso_init_{i}"), log_callback,
                     memory_mb=memory_mb, scratch_dir=scratch_dir,
                     disp_direction=disp_direction, node_filter=node_filter)
                 results.append((t_maps_init[i], md, sm))
             except Exception as exc:
-                log_callback(f"  [Hata] DE init birey #{i}: {exc}")
+                log_callback(f"  [Hata] PSO init parçacık #{i}: {exc}")
                 results.append((t_maps_init[i], 1e10, {}))
 
     fitness = np.full(pop_size, float('inf'))
@@ -1613,48 +1877,38 @@ def optimize_de(bdf_path, nastran_exe, output_dir, pids, allowable_map,
                 stress_map, allowable_map, stress_mode, sigma_count,
                 eid_pid_map, eid_area_map)
             fitness[i] = _fitness(t_map, max_disp, stress_ok)
-            tracker.record(f"DE_init_{i+1}", t_maps_init[i], max_disp, max_vm, stress_ok,
-                           allowable_map, log_callback)
+            tracker.record(f"PSO_init_{i+1}", t_maps_init[i], max_disp, max_vm,
+                           stress_ok, allowable_map, log_callback)
         except Exception as exc:
-            log_callback(f"  [Hata] DE init fitness #{i}: {exc}")
+            log_callback(f"  [Hata] PSO init fitness #{i}: {exc}")
 
-    best_idx = int(np.argmin(fitness))
-    best_t_overall  = dict(t_maps_init[best_idx])
-    best_fit_overall = fitness[best_idx]
+    pbest_pos = positions.copy()
+    pbest_fit = fitness.copy()
+    gbest_idx = int(np.argmin(pbest_fit))
+    gbest_pos = pbest_pos[gbest_idx].copy()
+    gbest_fit = float(pbest_fit[gbest_idx])
+    best_t_overall = dict(t_maps_init[gbest_idx])
 
-    # ── Ana DE döngüsü ─────────────────────────────────────────────────────
+    # ── Ana PSO döngüsü ─────────────────────────────────────────────────────
     for gen in range(max_iter):
         if stop_event is not None and stop_event.is_set():
-            log_callback("  DE durduruldu.")
+            log_callback("  PSO durduruldu.")
             break
 
         progress_callback((gen / max_iter) * 100.0)
 
-        best_x = population[best_idx].copy()
+        r1 = rng.random((pop_size, n))
+        r2 = rng.random((pop_size, n))
+        velocities = (w * velocities
+                      + c1 * r1 * (pbest_pos - positions)
+                      + c2 * r2 * (gbest_pos - positions))
+        velocities = np.clip(velocities, -v_max, v_max)
+        positions  = np.clip(positions + velocities, pid_min_arr, pid_max_arr)
 
-        # Deneme vektörleri oluştur (current-to-best/1/bin)
-        trials = np.zeros_like(population)
-        for i in range(pop_size):
-            # r1, r2: i'den farklı iki rastgele birey
-            candidates = [k for k in range(pop_size) if k != i]
-            r1, r2 = rng.choice(candidates, size=2, replace=False)
-
-            mutant = (population[i]
-                      + F * (best_x - population[i])
-                      + F * (population[r1] - population[r2]))
-            mutant = np.clip(mutant, pid_min_arr, pid_max_arr)
-
-            # Binomial crossover
-            cross_mask = rng.random(n) < CR
-            cross_mask[rng.randint(0, n)] = True  # en az 1 boyut mutanttan
-            trial = np.where(cross_mask, mutant, population[i])
-            trials[i] = trial
-
-        # Deneme vektörlerini değerlendir
-        trial_t_maps = [_to_t_map(trials[i]) for i in range(pop_size)]
+        trial_t_maps = [_to_t_map(positions[i]) for i in range(pop_size)]
 
         if n_parallel > 1:
-            batch = [(trial_t_maps[i], os.path.join(output_dir, f"de_g{gen+1}_i{i}"))
+            batch = [(trial_t_maps[i], os.path.join(output_dir, f"pso_g{gen+1}_i{i}"))
                      for i in range(pop_size)]
             try:
                 trial_results = solve_batch(nastran_exe, bdf_path, batch, n_parallel,
@@ -1663,7 +1917,7 @@ def optimize_de(bdf_path, nastran_exe, output_dir, pids, allowable_map,
                                             disp_direction=disp_direction,
                                             node_filter=node_filter)
             except Exception as exc:
-                log_callback(f"  [Hata] DE Gen {gen+1} batch: {exc}")
+                log_callback(f"  [Hata] PSO Gen {gen+1} batch: {exc}")
                 trial_results = [(trial_t_maps[i], 1e10, {}) for i in range(pop_size)]
         else:
             trial_results = []
@@ -1671,15 +1925,14 @@ def optimize_de(bdf_path, nastran_exe, output_dir, pids, allowable_map,
                 try:
                     md, sm = solve_and_evaluate(
                         nastran_exe, bdf_path, trial_t_maps[i],
-                        os.path.join(output_dir, f"de_g{gen+1}_i{i}"), log_callback,
+                        os.path.join(output_dir, f"pso_g{gen+1}_i{i}"), log_callback,
                         memory_mb=memory_mb, scratch_dir=scratch_dir,
                         disp_direction=disp_direction, node_filter=node_filter)
                     trial_results.append((trial_t_maps[i], md, sm))
                 except Exception as exc:
-                    log_callback(f"  [Hata] DE Gen {gen+1} Birey #{i}: {exc}")
+                    log_callback(f"  [Hata] PSO Gen {gen+1} Parçacık #{i}: {exc}")
                     trial_results.append((trial_t_maps[i], 1e10, {}))
 
-        # Seçim: trial fitness < mevcut fitness ise yer değiştir
         for i, item in enumerate(trial_results):
             if item is None:
                 continue
@@ -1688,24 +1941,160 @@ def optimize_de(bdf_path, nastran_exe, output_dir, pids, allowable_map,
                 stress_ok, _, max_vm = do_stress_check(
                     stress_map, allowable_map, stress_mode, sigma_count,
                     eid_pid_map, eid_area_map)
-                trial_fit = _fitness(trial_t_maps[i], max_disp, stress_ok)
-                tracker.record(f"DE_G{gen+1}_{i+1}", trial_t_maps[i], max_disp, max_vm,
+                fit_i = _fitness(trial_t_maps[i], max_disp, stress_ok)
+                tracker.record(f"PSO_G{gen+1}_{i+1}", trial_t_maps[i], max_disp, max_vm,
                                stress_ok, allowable_map, log_callback)
 
-                if trial_fit <= fitness[i]:
-                    population[i] = trials[i]
-                    fitness[i] = trial_fit
+                if fit_i < pbest_fit[i]:
+                    pbest_fit[i] = fit_i
+                    pbest_pos[i] = positions[i].copy()
 
-                if trial_fit < best_fit_overall:
-                    best_fit_overall = trial_fit
+                if fit_i < gbest_fit:
+                    gbest_fit      = fit_i
+                    gbest_pos      = positions[i].copy()
                     best_t_overall = dict(trial_t_maps[i])
             except Exception as exc:
-                log_callback(f"  [Hata] DE Gen {gen+1} seçim #{i}: {exc}")
+                log_callback(f"  [Hata] PSO Gen {gen+1} güncelleme #{i}: {exc}")
 
-        best_idx = int(np.argmin(fitness))
-        log_callback(f"  DE Gen {gen+1}/{max_iter}: best_fit={fitness[best_idx]:.4f}")
+        log_callback(f"  PSO Gen {gen+1}/{max_iter}: gbest_fit={gbest_fit:.4f}")
 
-    # Final çözüm
+    log_callback(f"\n{'='*50}")
+    log_callback("SON ÇÖZÜM")
+    final_dir = os.path.join(output_dir, "final_result")
+    final_disp, final_stress = solve_and_evaluate(
+        nastran_exe, bdf_path, best_t_overall, final_dir, log_callback,
+        memory_mb=memory_mb, scratch_dir=scratch_dir,
+        disp_direction=disp_direction, node_filter=node_filter
+    )
+    stress_ok, _, max_vm = do_stress_check(
+        final_stress, allowable_map, stress_mode, sigma_count,
+        eid_pid_map, eid_area_map)
+    tracker.record("Final", best_t_overall, final_disp, max_vm, stress_ok,
+                   allowable_map, log_callback)
+
+    progress_callback(100)
+    return best_t_overall, final_disp, final_stress
+
+
+# ---------------------------------------------------------------------------
+# ALGORİTMA 7: SPSA (Simultaneous Perturbation Stochastic Approximation)
+# ---------------------------------------------------------------------------
+
+def optimize_spsa(bdf_path, nastran_exe, output_dir, pids, allowable_map,
+                  min_t, max_t, step, max_disp_limit, max_iter,
+                  log_callback, progress_callback, tracker, n_parallel=1, memory_mb=0,
+                  pid_mid_map=None, mid_density_map=None, pid_area_map=None,
+                  pid_bounds=None, stress_mode="Element Based", sigma_count=0,
+                  eid_pid_map=None, eid_area_map=None, scratch_dir=None,
+                  disp_direction="Mag", node_filter=None, stop_event=None):
+    """SPSA (Simultaneous Perturbation Stochastic Approximation).
+
+    Her iterasyonda yalnızca 2 Nastran çalışması — n'den bağımsız.
+    Gradient tahmini: g_hat = (f(x+c*Δ) - f(x-c*Δ)) / (2c) * (1/Δ)
+    Δ: Bernoulli ±1 rastgele vektörü.
+    Gain sequences: Spall 1998 (alpha=0.602, gamma=0.101).
+    """
+    n = len(pids)
+
+    if pid_bounds:
+        pid_min_d  = {p: pid_bounds[p][0] for p in pids}
+        pid_max_d  = {p: pid_bounds[p][1] for p in pids}
+        pid_step_d = {p: pid_bounds[p][2] for p in pids}
+    else:
+        pid_min_d  = {p: min_t for p in pids}
+        pid_max_d  = {p: max_t for p in pids}
+        pid_step_d = {p: step  for p in pids}
+
+    pid_min_arr  = np.array([pid_min_d[p]  for p in pids])
+    pid_max_arr  = np.array([pid_max_d[p]  for p in pids])
+    pid_step_arr = np.array([pid_step_d[p] for p in pids])
+    mean_range   = float(np.mean(pid_max_arr - pid_min_arr))
+
+    alpha  = 0.602
+    gamma  = 0.101
+    A      = max_iter * 0.1
+    a_coef = mean_range * 0.05 * (1.0 + A) ** alpha
+    c_coef = max(float(np.mean(pid_step_arr)), 1e-6)
+
+    log_callback(f"\n  SPSA — {n} PSHELL, her iter 2 çözüm, max_iter={max_iter}")
+    log_callback(f"  Gain: a={a_coef:.4f}, c={c_coef:.4f}, A={A:.1f}")
+
+    def _fitness(t_map, max_disp_val, stress_ok_val):
+        mass, _ = compute_real_mass(t_map, pid_mid_map, mid_density_map, pid_area_map)
+        penalty = 0.0
+        if max_disp_val > max_disp_limit:
+            penalty += 1000.0 * (max_disp_val - max_disp_limit)
+        if not stress_ok_val:
+            penalty += 500.0
+        return mass + penalty
+
+    def _to_t_map(x):
+        clipped = np.clip(x, pid_min_arr, pid_max_arr)
+        rounded = np.round(clipped / np.maximum(pid_step_arr, 1e-10)) * pid_step_arr
+        rounded = np.round(np.clip(rounded, pid_min_arr, pid_max_arr), 1)
+        return {pids[j]: float(rounded[j]) for j in range(n)}
+
+    rng = np.random.RandomState(42)
+
+    x = (pid_min_arr + pid_max_arr) * 0.5
+    best_fit       = float('inf')
+    best_t_overall = _to_t_map(x)
+
+    # ── Ana SPSA döngüsü ─────────────────────────────────────────────────────
+    for k in range(max_iter):
+        if stop_event is not None and stop_event.is_set():
+            log_callback("  SPSA durduruldu.")
+            break
+
+        progress_callback((k / max_iter) * 100.0)
+
+        a_k = a_coef / (k + 1.0 + A) ** alpha
+        c_k = c_coef / (k + 1.0) ** gamma
+
+        delta   = rng.choice([-1.0, 1.0], size=n)
+        x_plus  = _to_t_map(x + c_k * delta)
+        x_minus = _to_t_map(x - c_k * delta)
+
+        batch = [
+            (x_plus,  os.path.join(output_dir, f"spsa_k{k+1}_plus")),
+            (x_minus, os.path.join(output_dir, f"spsa_k{k+1}_minus")),
+        ]
+        try:
+            pair_results = solve_batch(nastran_exe, bdf_path, batch, 2,
+                                       log_callback, memory_mb=memory_mb,
+                                       scratch_dir=scratch_dir,
+                                       disp_direction=disp_direction,
+                                       node_filter=node_filter)
+        except Exception as exc:
+            log_callback(f"  [Hata] SPSA iter {k+1}: {exc}")
+            pair_results = [(x_plus, 1e10, {}), (x_minus, 1e10, {})]
+
+        f_vals = []
+        for idx_r, (t_map, max_disp, stress_map) in enumerate(pair_results):
+            try:
+                stress_ok, _, max_vm = do_stress_check(
+                    stress_map, allowable_map, stress_mode, sigma_count,
+                    eid_pid_map, eid_area_map)
+                fv = _fitness(t_map, max_disp, stress_ok)
+                f_vals.append(fv)
+                label = "+" if idx_r == 0 else "-"
+                tracker.record(f"SPSA_k{k+1}{label}", t_map, max_disp, max_vm,
+                               stress_ok, allowable_map, log_callback)
+                if fv < best_fit:
+                    best_fit       = fv
+                    best_t_overall = dict(t_map)
+            except Exception as exc:
+                log_callback(f"  [Hata] SPSA iter {k+1} fitness: {exc}")
+                f_vals.append(1e10)
+
+        if len(f_vals) == 2:
+            f_plus, f_minus = f_vals
+            g_hat = (f_plus - f_minus) / (2.0 * max(c_k, 1e-10) * delta)
+            x = np.clip(x - a_k * g_hat, pid_min_arr, pid_max_arr)
+
+        log_callback(f"  SPSA k={k+1}/{max_iter}: a_k={a_k:.5f}, c_k={c_k:.5f}, "
+                     f"best_fit={best_fit:.4f}")
+
     log_callback(f"\n{'='*50}")
     log_callback("SON ÇÖZÜM")
     final_dir = os.path.join(output_dir, "final_result")
@@ -1961,12 +2350,15 @@ class NastranToolApp:
         algo_combo["values"] = (
             "OC + sep-CMA-ES (Hibrit)",
             "OC Standalone (Seri, Hızlı)",
-            "Differential Evolution (DE)",
+            "L-SHADE (Adaptive DE)",
+            "PSO (Particle Swarm)",
+            "SPSA (Stochastic Gradient)",
             "Genetic Algorithm (GA)",
             "FD + SQP (Forward Difference)",
         )
         algo_combo.current(0)
         algo_combo.grid(row=3, column=1, columnspan=4, sticky=tk.W, padx=2, pady=(4, 0))
+        algo_combo.bind("<<ComboboxSelected>>", self._on_algo_changed)
 
         ttk.Label(param_frame, text="Sonuç Saklama:").grid(row=4, column=0, sticky=tk.W, padx=2, pady=(4, 0))
         self.output_retain_var = tk.StringVar()
@@ -2060,6 +2452,15 @@ class NastranToolApp:
         self.canvas = FigureCanvasTkAgg(self.fig, master=right_frame)
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
         self.canvas.draw()
+
+    def _on_algo_changed(self, event=None):
+        """SPSA seçilince Paralel Run devre dışı bırakılır."""
+        if "SPSA" in self.algo_var.get():
+            self.n_parallel_entry.configure(state=tk.DISABLED)
+            self.n_parallel_entry.delete(0, tk.END)
+            self.n_parallel_entry.insert(0, "1")
+        else:
+            self.n_parallel_entry.configure(state=tk.NORMAL)
 
     def _on_stress_mode_changed(self, event=None):
         """Stress modu degistiginde sigma butonlarini aktif/deaktif yap."""
@@ -2220,14 +2621,21 @@ class NastranToolApp:
             total_run = max_iter + 1
             detail = f"{max_iter} OC iter (1 run/iter) + 1 final  ← seri için en verimli"
 
-        elif "Differential" in algo_name or "DE" in algo_name:
-            de_pop = max(n_parallel, min(50, max(15, n_pids // 4)))
-            init_rounds = max(1, -(-de_pop // max(n_parallel, 1)))
-            gen_rounds  = max(1, -(-de_pop // max(n_parallel, 1)))
-            total_run = de_pop + de_pop * max_iter + 1  # init + gens + final
-            detail = (f"Init: {de_pop} birey + "
-                      f"{max_iter} nesil x {de_pop} birey + 1 final  "
-                      f"[{init_rounds + gen_rounds * max_iter} paralel tur]")
+        elif "L-SHADE" in algo_name or "Adaptive" in algo_name:
+            ls_pop = max(n_parallel, min(50, max(15, n_pids // 4)))
+            ls_min = max(4, n_parallel)
+            total_run = ls_pop + ls_pop * max_iter + 1
+            detail = (f"Init: {ls_pop} + {max_iter} nesil x ~{ls_pop} birey + 1 final "
+                      f"[pop shrinks {ls_pop}→{ls_min}]")
+
+        elif "PSO" in algo_name or "Particle" in algo_name:
+            pso_pop = max(n_parallel, min(40, max(15, n_pids // 5)))
+            total_run = pso_pop + pso_pop * max_iter + 1
+            detail = (f"Init: {pso_pop} + {max_iter} nesil x {pso_pop} parçacık + 1 final")
+
+        elif "SPSA" in algo_name or "Stochastic Gradient" in algo_name:
+            total_run = 2 * max_iter + 1
+            detail = f"Her iter 2 çözüm (±Δ) x {max_iter} iter + 1 final — n'den bağımsız!"
 
         elif "GA" in algo_name or "Genetic" in algo_name:
             pop_size = max(10, 2 * n_pids)
@@ -2516,9 +2924,17 @@ class NastranToolApp:
                 algo_kwargs.update(_mass_kwargs, mid_E_map=mid_E_map)
                 result_t, final_disp, final_stress = optimize_oc(**algo_kwargs)
 
-            elif "Differential" in algo_name or "DE" in algo_name:
+            elif "L-SHADE" in algo_name or "Adaptive" in algo_name:
                 algo_kwargs.update(_mass_kwargs)
-                result_t, final_disp, final_stress = optimize_de(**algo_kwargs)
+                result_t, final_disp, final_stress = optimize_lshade(**algo_kwargs)
+
+            elif "PSO" in algo_name or "Particle" in algo_name:
+                algo_kwargs.update(_mass_kwargs)
+                result_t, final_disp, final_stress = optimize_pso(**algo_kwargs)
+
+            elif "SPSA" in algo_name or "Stochastic Gradient" in algo_name:
+                algo_kwargs.update(_mass_kwargs)
+                result_t, final_disp, final_stress = optimize_spsa(**algo_kwargs)
 
             elif "OC" in algo_name or "CMA" in algo_name:
                 algo_kwargs.update(_mass_kwargs, mid_E_map=mid_E_map)
