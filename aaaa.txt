@@ -38,7 +38,7 @@ class _NullWriter:
 
 
 def _make_op2():
-    m = OP2(debug=False)
+    m = OP2(debug=False, mode='nx')
     m.binary_debug = _NullWriter()
     if m.log is None:
         _l = _logging.getLogger('pynastran_null')
@@ -239,6 +239,14 @@ def run_nastran(nastran_exe, bdf_path, output_dir, log_callback, memory_mb=0, sc
 
     if result.returncode != 0:
         log_callback(f"  Nastran return code: {result.returncode}")
+
+    # OP2 dosyasının tam yazılmasını bekle (NX Nastran bazen geç flush eder)
+    import time as _time
+    for _wait in range(10):
+        if os.path.isfile(op2_path) and os.path.getsize(op2_path) > 0:
+            _time.sleep(0.3)   # flush için kısa ek bekleme
+            break
+        _time.sleep(0.5)
 
     if not os.path.isfile(op2_path):
         raise FileNotFoundError(
