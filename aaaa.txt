@@ -67,7 +67,7 @@ def read_bdf_model(bdf_path):
         eid_pid_map: {eid: pid} eleman -> property eşlemesi
         eid_area_map: {eid: area} eleman alanları
     """
-    model = BDF()
+    model = BDF(debug=False)
     model.read_bdf(bdf_path, xref=True)
 
     pids = []
