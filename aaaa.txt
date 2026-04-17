@@ -2428,8 +2428,9 @@ class NastranToolApp:
         self.canvas.draw()
 
     def _on_algo_changed(self, event=None):
-        """SPSA seçilince Paralel Run devre dışı bırakılır."""
-        if "SPSA" in self.algo_var.get():
+        algo = self.algo_var.get()
+        no_parallel = "SPSA" in algo or "Standalone" in algo
+        if no_parallel:
             self.n_parallel_entry.configure(state=tk.DISABLED)
             self.n_parallel_entry.delete(0, tk.END)
             self.n_parallel_entry.insert(0, "1")
