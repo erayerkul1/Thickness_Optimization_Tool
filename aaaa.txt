@@ -12,6 +12,7 @@ Algoritmalar:
 import os
 import glob as globmod
 import subprocess
+import logging as _logging
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 import threading
@@ -39,6 +40,11 @@ class _NullWriter:
 def _make_op2():
     m = OP2(debug=False)
     m.binary_debug = _NullWriter()
+    if m.log is None:
+        _l = _logging.getLogger('pynastran_null')
+        if not _l.handlers:
+            _l.addHandler(_logging.NullHandler())
+        m.log = _l
     return m
 
 
@@ -460,7 +466,12 @@ def solve_and_evaluate(nastran_exe, bdf_path, thickness_map, work_dir, log_callb
 
     op2_path = run_nastran(nastran_exe, modified_bdf, work_dir, log_callback, memory_mb=memory_mb, scratch_dir=scratch_dir)
     op2_model = _make_op2()
-    op2_model.read_op2(op2_path)
+    try:
+        op2_model.read_op2(op2_path)
+    except AttributeError as _ae:
+        raise RuntimeError(
+            f"OP2 okunamadı — Nastran başarısız veya OP2 bozuk. Detay: {_ae}"
+        ) from _ae
 
     max_disp = get_max_absolute_displacement(op2_model, direction=disp_direction)
     stress_map = get_von_mises_stresses(op2_model)
@@ -2666,7 +2677,12 @@ class NastranToolApp:
 
             op2_path = run_nastran(nastran_exe, bdf_path, output_dir, self._log)
             op2_model = _make_op2()
-            op2_model.read_op2(op2_path)
+            try:
+                op2_model.read_op2(op2_path)
+            except AttributeError as _ae:
+                raise RuntimeError(
+                    f"OP2 okunamadı — Nastran başarısız veya OP2 bozuk. Detay: {_ae}"
+                ) from _ae
             extract_results_csv(op2_model, output_dir, "result", self._log)
 
             max_disp = get_max_absolute_displacement(op2_model, direction=disp_direction)
