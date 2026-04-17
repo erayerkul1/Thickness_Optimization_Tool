@@ -27,6 +27,21 @@ from pyNastran.op2.op2 import OP2
 from pyNastran.bdf.bdf import BDF
 
 
+class _NullWriter:
+    """pyNastran binary_debug için no-op writer.
+    Eski pyNastran sürümlerinde binary_debug=None olduğunda bazı
+    iç kod yolları .write() çağırır ve NoneType hatasına yol açar."""
+    def write(self, *a): pass
+    def flush(self): pass
+    def close(self): pass
+
+
+def _make_op2():
+    m = OP2(debug=False)
+    m.binary_debug = _NullWriter()
+    return m
+
+
 # ---------------------------------------------------------------------------
 # Yardımcı fonksiyonlar
 # ---------------------------------------------------------------------------
@@ -444,7 +459,7 @@ def solve_and_evaluate(nastran_exe, bdf_path, thickness_map, work_dir, log_callb
     modify_pshell_thicknesses(bdf_path, modified_bdf, thickness_map, log_callback)
 
     op2_path = run_nastran(nastran_exe, modified_bdf, work_dir, log_callback, memory_mb=memory_mb, scratch_dir=scratch_dir)
-    op2_model = OP2(debug=False)
+    op2_model = _make_op2()
     op2_model.read_op2(op2_path)
 
     max_disp = get_max_absolute_displacement(op2_model, direction=disp_direction)
@@ -2413,8 +2428,9 @@ class NastranToolApp:
         self.canvas.draw()
 
     def _on_algo_changed(self, event=None):
-        """SPSA seçilince Paralel Run devre dışı bırakılır."""
-        if "SPSA" in self.algo_var.get():
+        algo = self.algo_var.get()
+        no_parallel = "SPSA" in algo or "Standalone" in algo
+        if no_parallel:
             self.n_parallel_entry.configure(state=tk.DISABLED)
             self.n_parallel_entry.delete(0, tk.END)
             self.n_parallel_entry.insert(0, "1")
@@ -2649,7 +2665,7 @@ class NastranToolApp:
             self._log("=" * 50)
 
             op2_path = run_nastran(nastran_exe, bdf_path, output_dir, self._log)
-            op2_model = OP2(debug=False)
+            op2_model = _make_op2()
             op2_model.read_op2(op2_path)
             extract_results_csv(op2_model, output_dir, "result", self._log)
 
