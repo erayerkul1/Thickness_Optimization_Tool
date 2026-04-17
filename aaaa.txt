@@ -2653,11 +2653,14 @@ class NastranToolApp:
             max_disp = get_max_absolute_displacement(op2_model, direction=disp_direction)
             max_vm = max(get_von_mises_stresses(op2_model).values()) if get_von_mises_stresses(op2_model) else 0.0
 
+            del op2_model
+            cleanup_nastran_outputs(output_dir, self._log)
+
             # BDF'den mass bilgisi
             self._log("\nBDF okunuyor (mass hesabı)...")
             pids, pid_mid_map, mid_density_map, _, pid_area_map, _, _ = read_bdf_model(bdf_path)
             # Mevcut kalınlıkları oku
-            bdf_model = BDF()
+            bdf_model = BDF(debug=False)
             bdf_model.read_bdf(bdf_path, xref=False)
             current_t = {}
             for pid, prop in bdf_model.properties.items():
