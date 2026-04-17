@@ -497,7 +497,7 @@ def solve_and_evaluate(nastran_exe, bdf_path, thickness_map, work_dir, log_callb
     modify_pshell_thicknesses(bdf_path, modified_bdf, thickness_map, log_callback)
 
     op2_path = run_nastran(nastran_exe, modified_bdf, work_dir, log_callback, memory_mb=memory_mb, scratch_dir=scratch_dir)
-    op2_model = OP2()
+    op2_model = OP2(debug=False)
     op2_model.read_op2(op2_path)
 
     max_disp = get_max_absolute_displacement(op2_model, direction=disp_direction, node_filter=node_filter)
@@ -2759,7 +2759,7 @@ class NastranToolApp:
             self._log("=" * 50)
 
             op2_path = run_nastran(nastran_exe, bdf_path, output_dir, self._log)
-            op2_model = OP2()
+            op2_model = OP2(debug=False)
             op2_model.read_op2(op2_path)
             extract_results_csv(op2_model, output_dir, "result", self._log)
 
