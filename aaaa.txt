@@ -537,6 +537,9 @@ class IterationTracker:
     def record(self, iteration_label, thickness_map, max_disp, max_vm, stress_ok,
                allowable_map, log_callback):
         """Bir iterasyonu kaydet, mass summary bas, grafiği güncelle."""
+        if max_disp >= 1e9:
+            log_callback(f"  [{iteration_label}] Nastran başarısız, iterasyon atlanıyor.")
+            return 0.0
         total_mass, _ = compute_real_mass(
             thickness_map, self.pid_mid_map, self.mid_density_map, self.pid_area_map
         )
@@ -2865,14 +2868,24 @@ class NastranToolApp:
                 result_t, final_disp, final_stress = optimize_genetic(**algo_kwargs)
 
             # Tüm iterasyonları tara: displacement + stress kısıtını sağlayan en hafif çözüm
+            if stress_mode == "Average Stress":
+                _avg_tmp = compute_average_stress_per_pid(
+                    final_stress, eid_pid_map, eid_area_map, sigma_count)
+                _final_ok, _, _ = check_stress_constraints_average(_avg_tmp, prop_allowable_map)
+            else:
+                _final_ok, _, _ = check_stress_constraints(final_stress, allowable_map)
+            current_is_feasible = (final_disp <= max_disp_limit and _final_ok)
+
             best_feasible_t, best_feasible_mass = tracker.get_best_feasible(max_disp_limit)
             if best_feasible_t is not None:
                 current_final_mass, _ = compute_real_mass(
                     result_t, tracker.pid_mid_map, tracker.mid_density_map, tracker.pid_area_map
                 )
-                if best_feasible_mass < current_final_mass:
-                    self._log(f"\n  En iyi uygun iterasyon algoritmadan daha hafif:")
-                    self._log(f"    Algoritma sonucu: {current_final_mass:.6f} kg")
+                should_override = (not current_is_feasible) or (best_feasible_mass < current_final_mass)
+                if should_override:
+                    reason = "algoritma sonucu kısıtları sağlamıyor" if not current_is_feasible else "daha hafif uygun çözüm bulundu"
+                    self._log(f"\n  En iyi uygun çözüme geçiliyor ({reason}):")
+                    self._log(f"    Algoritma sonucu: {current_final_mass:.6f} kg  feasible={current_is_feasible}")
                     self._log(f"    En hafif feasible: {best_feasible_mass:.6f} kg")
                     self._log(f"  Yeniden çözülüyor...")
                     best_dir = os.path.join(output_dir, "best_feasible_result")
@@ -2884,6 +2897,9 @@ class NastranToolApp:
                     result_t = best_feasible_t
                     final_disp = best_disp2
                     final_stress = best_stress2
+            elif not current_is_feasible:
+                self._log("\n  UYARI: Hiç uygun (feasible) çözüm bulunamadı. "
+                          "En iyi bulunan sonuç (kısıt ihlali var) döndürülüyor.")
 
             # Sonuç raporu
             self._log(f"\n{'='*60}")
