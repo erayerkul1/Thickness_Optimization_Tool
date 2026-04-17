@@ -261,13 +261,18 @@ def get_von_mises_stresses(op2_model):
 def get_max_absolute_displacement(op2_model, direction="Mag", node_filter=None):
     """OP2 modelinden maksimum displacement değerini okur.
     direction: 'Mag' (büyüklük), 'X' (T1), 'Y' (T2), 'Z' (T3)
-    node_filter: set of int node IDs; sadece bu nodelar dikkate alınır.
-                 None ise tüm nodelar kullanılır.
+    node_filter: set of int node IDs  → sadece bu nodelar, mutlak max döner
+                 dict[int, float]     → per-node limit; max(disp_i/limit_i) oranı döner
+                 None                 → tüm nodelar kullanılır
     """
     _dir_idx = {"X": 0, "Y": 1, "Z": 2}
     max_disp = 0.0
     if not op2_model.displacements:
         return 0.0
+
+    per_node_mode = (isinstance(node_filter, dict)
+                     and any(v is not None for v in node_filter.values()))
+
     for subcase_id, disp_obj in op2_model.displacements.items():
         node_ids = disp_obj.node_gridtype[:, 0]
 
@@ -285,10 +290,21 @@ def get_max_absolute_displacement(op2_model, direction="Mag", node_filter=None):
             idx = _dir_idx[direction]
             values = np.abs(disp_obj.data[:, :, idx])
 
-        filtered_values = values[:, mask]
-        current_max = float(np.max(filtered_values))
-        if current_max > max_disp:
-            max_disp = current_max
+        if per_node_mode:
+            masked_node_ids = node_ids[mask]
+            filtered_values = values[:, mask]
+            node_max = np.max(filtered_values, axis=0)
+            for j, nid in enumerate(masked_node_ids):
+                limit = node_filter.get(int(nid))
+                if limit is not None and limit > 0:
+                    ratio = float(node_max[j]) / limit
+                    if ratio > max_disp:
+                        max_disp = ratio
+        else:
+            filtered_values = values[:, mask]
+            current_max = float(np.max(filtered_values))
+            if current_max > max_disp:
+                max_disp = current_max
     return max_disp
 
 
@@ -346,18 +362,28 @@ def load_thickness_range_excel(excel_path):
 
 
 def load_displacement_nodes_excel(excel_path, sheet_name="Displacement"):
-    """Excel'deki Displacement sayfasından Node ID listesini okur.
-    Sayfa; 'Node ID' başlıklı A sütununda node ID'leri içermelidir.
-    Returns: set of int node IDs, or None if sheet is empty or doesn't exist.
+    """Excel'deki Displacement sayfasından Node ID ve limit değerlerini okur.
+    A sütunu: Node ID (başlık: 'Node ID')
+    B sütunu: Max Displacement limiti (başlık: 'Max Displacement') — opsiyonel
+    Returns: dict[int, float|None], or None if sheet is empty or doesn't exist.
     """
     try:
-        df = pd.read_excel(excel_path, sheet_name=sheet_name)
-        df.columns = [c.strip() for c in df.columns]
-        id_col = df.columns[0]
-        node_ids = df[id_col].dropna()
-        if node_ids.empty:
+        df = pd.read_excel(excel_path, sheet_name=sheet_name, header=0)
+        if df.empty or df.shape[1] < 1:
             return None
-        return set(int(nid) for nid in node_ids)
+        node_col = df.iloc[:, 0].dropna()
+        if node_col.empty:
+            return None
+        if df.shape[1] >= 2:
+            disp_col = df.iloc[:, 1]
+            result = {}
+            for idx in node_col.index:
+                nid = int(node_col[idx])
+                val = disp_col[idx] if idx in disp_col.index else None
+                result[nid] = float(val) if pd.notna(val) else None
+        else:
+            result = {int(nid): None for nid in node_col}
+        return result if result else None
     except Exception:
         return None
 
@@ -2212,6 +2238,7 @@ class NastranToolApp:
         self.use_node_filter = False
         self.node_filter_data = None
         self._stop_event = threading.Event()
+        self._per_node_disp = False
         self._build_ui()
 
     def _build_ui(self):
@@ -2511,24 +2538,33 @@ class NastranToolApp:
             return
 
         if not self.use_node_filter:
-            node_ids = load_displacement_nodes_excel(excel_path)
-            if not node_ids:
+            node_disp_dict = load_displacement_nodes_excel(excel_path)
+            if not node_disp_dict:
                 messagebox.showerror(
                     "Hata",
                     "Excel'de 'Displacement' sayfası bulunamadı veya Node ID listesi boş.\n"
-                    "Sayfanın adı 'Displacement' olmalı ve A sütununda Node ID'ler bulunmalıdır."
+                    "A sütunu: Node ID, B sütunu: Max Displacement"
                 )
                 return
-            self.node_filter_data = node_ids
+            self.node_filter_data = node_disp_dict
             self.use_node_filter = True
+            has_limits = any(v is not None for v in node_disp_dict.values())
+            self._per_node_disp = has_limits
+            if has_limits:
+                self.max_disp_entry.configure(state=tk.DISABLED)
+                self.max_disp_entry.delete(0, tk.END)
+                self.max_disp_entry.insert(0, "1.0")
             self.node_filter_btn.configure(text="Node Filtresini Kaldır")
-            self.node_filter_label.configure(
-                text=f"{len(node_ids)} node yüklendi", foreground="green"
-            )
-            self._log(f"  Node filtresi aktif: {len(node_ids)} node yüklendi.")
+            n = len(node_disp_dict)
+            lbl = f"{n} node ({'limit var' if has_limits else 'sadece filtre'})"
+            self.node_filter_label.configure(text=lbl, foreground="green")
+            self._log(f"  Node filtresi aktif: {n} node"
+                      + (" + per-node displacement limitleri" if has_limits else "") + ".")
         else:
             self.use_node_filter = False
             self.node_filter_data = None
+            self._per_node_disp = False
+            self.max_disp_entry.configure(state=tk.NORMAL)
             self.node_filter_btn.configure(text="Excel'den Node Oku")
             self.node_filter_label.configure(text="Devre Dışı", foreground="gray")
             self._log("  Node filtresi kaldırıldı (tüm nodelar kullanılacak).")
@@ -2785,6 +2821,8 @@ class NastranToolApp:
 
         try:
             max_disp_limit = float(self.max_disp_entry.get().strip())
+            if getattr(self, '_per_node_disp', False):
+                max_disp_limit = 1.0
             max_iter = int(self.max_iter_entry.get().strip())
             n_parallel = int(self.n_parallel_entry.get().strip())
             if n_parallel < 1:
