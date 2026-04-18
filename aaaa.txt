@@ -240,13 +240,24 @@ def run_nastran(nastran_exe, bdf_path, output_dir, log_callback, memory_mb=0, sc
     if result.returncode != 0:
         log_callback(f"  Nastran return code: {result.returncode}")
 
-    # OP2 dosyasının tam yazılmasını bekle (NX Nastran bazen geç flush eder)
+    # OP2 dosyasının tam yazılmasını bekle (paralel koşularda NX Nastran geç flush eder)
     import time as _time
-    for _wait in range(10):
-        if os.path.isfile(op2_path) and os.path.getsize(op2_path) > 0:
-            _time.sleep(0.3)   # flush için kısa ek bekleme
-            break
-        _time.sleep(0.5)
+    _deadline = _time.time() + 120  # max 120s bekle
+    _prev_size = -1
+    _stable_count = 0
+    while _time.time() < _deadline:
+        if os.path.isfile(op2_path):
+            _sz = os.path.getsize(op2_path)
+            if _sz > 0:
+                if _sz == _prev_size:
+                    _stable_count += 1
+                    if _stable_count >= 3:   # 3 ardışık kontrol = ~3s boyut değişmedi
+                        _time.sleep(0.3)     # son flush buffer'ı
+                        break
+                else:
+                    _stable_count = 0
+                    _prev_size = _sz
+        _time.sleep(1.0)
 
     if not os.path.isfile(op2_path):
         raise FileNotFoundError(
@@ -1066,7 +1077,7 @@ def optimize_genetic(bdf_path, nastran_exe, output_dir, pids, allowable_map,
 
             # Crossover (BLX-alpha)
             child = parent1.copy()
-            if rng.random() < crossover_rate:
+            if rng.random_sample() < crossover_rate:
                 alpha = 0.5
                 for j in range(n):
                     lo = min(parent1[j], parent2[j])
@@ -1075,7 +1086,7 @@ def optimize_genetic(bdf_path, nastran_exe, output_dir, pids, allowable_map,
                     child[j] = rng.uniform(lo - alpha * span, hi + alpha * span)
 
             # Mutasyon
-            if rng.random() < mutation_rate:
+            if rng.random_sample() < mutation_rate:
                 mut_idx = rng.randint(0, n)
                 child[mut_idx] += rng.normal(0, (pid_max[mut_idx] - pid_min[mut_idx]) * 0.1)
 
@@ -1829,7 +1840,7 @@ def optimize_lshade(bdf_path, nastran_exe, output_dir, pids, allowable_map,
                       + Fi * (population[r1] - x_r2))
             mutant = np.clip(mutant, pid_min_arr, pid_max_arr)
 
-            cross_mask = rng.random(n) < CRi
+            cross_mask = rng.random_sample(n) < CRi
             cross_mask[rng.randint(0, n)] = True
             trials[i] = np.where(cross_mask, mutant, population[i])
 
@@ -2021,7 +2032,7 @@ def optimize_pso(bdf_path, nastran_exe, output_dir, pids, allowable_map,
         rng.shuffle(vals)
         positions[:, j] = vals
 
-    velocities = (rng.random((pop_size, n)) - 0.5) * v_max
+    velocities = (rng.random_sample((pop_size, n)) - 0.5) * v_max
 
     log_callback(f"\n  Başlangıç sürüsü değerlendiriliyor ({pop_size} parçacık)...")
     t_maps_init = [_to_t_map(positions[i]) for i in range(pop_size)]
@@ -2097,8 +2108,8 @@ def optimize_pso(bdf_path, nastran_exe, output_dir, pids, allowable_map,
 
         progress_callback((gen / max_iter) * 100.0)
 
-        r1 = rng.random((pop_size, n))
-        r2 = rng.random((pop_size, n))
+        r1 = rng.random_sample((pop_size, n))
+        r2 = rng.random_sample((pop_size, n))
         velocities = (w * velocities
                       + c1 * r1 * (pbest_pos - positions)
                       + c2 * r2 * (gbest_pos - positions))
