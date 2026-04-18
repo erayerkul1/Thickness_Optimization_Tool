@@ -33,16 +33,32 @@ _ref_op2_lock = threading.Lock()
 
 
 class _NullWriter:
-    """pyNastran binary_debug için no-op writer.
-    Eski pyNastran sürümlerinde binary_debug=None olduğunda bazı
-    iç kod yolları .write() çağırır ve NoneType hatasına yol açar."""
-    def write(self, *a): pass
+    """pyNastran binary_debug için no-op writer."""
+    def write(self, *a, **kw): pass
     def flush(self): pass
     def close(self): pass
+    def __getattr__(self, name):
+        return lambda *a, **kw: None
+
+
+class _SafeOP2(OP2):
+    """binary_debug setter'ı None atamasını engeller.
+
+    pyNastran read_op2() içinde self.binary_debug = None yapıyor ve
+    ardından .write() çağırıyor. Bu alt sınıf setter'ı override ederek
+    None yerine _NullWriter() koyar; böylece AttributeError oluşmaz.
+    """
+    @property
+    def binary_debug(self):
+        return self.__dict__.get('_binary_debug', _NullWriter())
+
+    @binary_debug.setter
+    def binary_debug(self, value):
+        self.__dict__['_binary_debug'] = _NullWriter() if value is None else value
 
 
 def _make_op2():
-    m = OP2(debug=False, mode='nx')
+    m = _SafeOP2(debug=False, mode='nx')
     m.binary_debug = _NullWriter()
     if m.log is None:
         _l = _logging.getLogger('pynastran_null')
