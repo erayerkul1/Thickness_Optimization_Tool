@@ -42,11 +42,11 @@ class _NullWriter:
 
 
 class _SafeOP2(OP2):
-    """binary_debug setter'ı None atamasını engeller.
+    """binary_debug setter/deleter'ı None/silme işlemini engeller.
 
-    pyNastran read_op2() içinde self.binary_debug = None yapıyor ve
-    ardından .write() çağırıyor. Bu alt sınıf setter'ı override ederek
-    None yerine _NullWriter() koyar; böylece AttributeError oluşmaz.
+    pyNastran read_op2() içinde hem self.binary_debug = None hem de
+    del self.binary_debug yapabiliyor. İkisi de .write() hatasına yol
+    açar. Bu alt sınıf her ikisini de _NullWriter()'a yönlendirir.
     """
     @property
     def binary_debug(self):
@@ -55,6 +55,10 @@ class _SafeOP2(OP2):
     @binary_debug.setter
     def binary_debug(self, value):
         self.__dict__['_binary_debug'] = _NullWriter() if value is None else value
+
+    @binary_debug.deleter
+    def binary_debug(self):
+        self.__dict__['_binary_debug'] = _NullWriter()
 
 
 def _make_op2():
@@ -260,40 +264,24 @@ def run_nastran(nastran_exe, bdf_path, output_dir, log_callback, memory_mb=0, sc
     if result.returncode != 0:
         log_callback(f"  Nastran return code: {result.returncode}")
 
-    # OP2 dosyasının tam yazılmasını bekle
+    # OP2 dosyasının tam yazılmasını bekle (max 120s)
     import time as _time
     global _ref_op2_size
+    _deadline = _time.time() + 120
     if _ref_op2_size > 0:
-        # Referans boyut biliniyorsa: boyut >= %95 olunca hazır say
-        _threshold = int(_ref_op2_size * 0.95)
-        _deadline = _time.time() + 120
+        # Referans boyut biliniyorsa: boyut >= %90 olunca hazır say
+        _threshold = int(_ref_op2_size * 0.90)
         while _time.time() < _deadline:
             if os.path.isfile(op2_path) and os.path.getsize(op2_path) >= _threshold:
-                _time.sleep(0.2)
                 break
             _time.sleep(0.5)
     else:
-        # İlk çözüm — boyut stabilizasyonuyla kalibre et, referansı kaydet
-        _deadline = _time.time() + 120
-        _prev_size = -1
-        _stable_count = 0
+        # Referans bilinmiyor — dosya oluşana kadar bekle, sonra 2s flush buffer
         while _time.time() < _deadline:
-            if os.path.isfile(op2_path):
-                _sz = os.path.getsize(op2_path)
-                if _sz > 0:
-                    if _sz == _prev_size:
-                        _stable_count += 1
-                        if _stable_count >= 3:
-                            _time.sleep(0.3)
-                            with _ref_op2_lock:
-                                if _ref_op2_size == 0:
-                                    _ref_op2_size = _sz
-                                    log_callback(f"  [Kalibrasyon] Referans OP2 boyutu: {_sz:,} bayt")
-                            break
-                    else:
-                        _stable_count = 0
-                        _prev_size = _sz
-            _time.sleep(1.0)
+            if os.path.isfile(op2_path) and os.path.getsize(op2_path) > 0:
+                _time.sleep(2.0)
+                break
+            _time.sleep(0.5)
 
     if not os.path.isfile(op2_path):
         raise FileNotFoundError(
@@ -523,6 +511,13 @@ def solve_and_evaluate(nastran_exe, bdf_path, thickness_map, work_dir, log_callb
     op2_model = _make_op2()
     try:
         op2_model.read_op2(op2_path)
+        # İlk başarılı okumadan referans boyutu kaydet
+        global _ref_op2_size
+        with _ref_op2_lock:
+            if _ref_op2_size == 0:
+                _sz = os.path.getsize(op2_path)
+                if _sz > 102400:   # en az 100KB — geçerli OP2
+                    _ref_op2_size = _sz
     except AttributeError as _ae:
         raise RuntimeError(
             f"OP2 okunamadı — Nastran başarısız veya OP2 bozuk. Detay: {_ae}"
@@ -3021,6 +3016,7 @@ class NastranToolApp:
         finally:
             self.root.after(0, self._finish)
 
+
     def _on_run(self):
         vals = self._validate_common()
         if not vals:
@@ -3353,10 +3349,6 @@ class NastranToolApp:
                 allowable_map, self._log
             )
 
-            # Scratch klasorunu temizle
-            if scratch_dir:
-                cleanup_scratch_dir(scratch_dir, self._log)
-
             self._log("\nİŞLEM TAMAMLANDI!")
             self.root.after(0, lambda: messagebox.showinfo(
                 "Optimizasyon Tamamlandı",
@@ -3371,6 +3363,11 @@ class NastranToolApp:
             self._log(f"\nHATA: {error_msg}")
             self.root.after(0, lambda msg=error_msg: messagebox.showerror("Hata", msg))
         finally:
+            if scratch_dir:
+                try:
+                    cleanup_scratch_dir(scratch_dir, self._log)
+                except Exception:
+                    pass
             self.root.after(0, self._finish)
 
 
