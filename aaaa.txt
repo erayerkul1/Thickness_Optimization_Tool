@@ -72,6 +72,32 @@ def _make_op2():
     return m
 
 
+def _read_op2_with_retry(op2_path, log_callback, max_attempts=5, wait_sec=5.0):
+    """OP2 okumayı birkaç kez dener; her denemede yeni _SafeOP2 nesnesi kullanır.
+
+    Nastran yavaş flush eden dosya sistemlerinde (ağ sürücüsü vb.) veya
+    pyNastran iç nesnelerinde geçici hata olduğunda otomatik düzelir.
+    """
+    import time as _time
+    last_exc = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            m = _make_op2()
+            m.read_op2(op2_path)
+            return m
+        except Exception as _exc:
+            last_exc = _exc
+            if attempt < max_attempts:
+                log_callback(
+                    f"  OP2 okuma denemesi {attempt}/{max_attempts} başarısız "
+                    f"({_exc}), {wait_sec:.0f}s bekleniyor..."
+                )
+                _time.sleep(wait_sec)
+    raise RuntimeError(
+        f"OP2 okunamadı — {max_attempts} deneme sonuç vermedi. Son hata: {last_exc}"
+    ) from last_exc
+
+
 # ---------------------------------------------------------------------------
 # Yardımcı fonksiyonlar
 # ---------------------------------------------------------------------------
@@ -276,10 +302,10 @@ def run_nastran(nastran_exe, bdf_path, output_dir, log_callback, memory_mb=0, sc
                 break
             _time.sleep(0.5)
     else:
-        # Referans bilinmiyor — dosya oluşana kadar bekle, sonra 2s flush buffer
+        # Referans bilinmiyor — dosya oluşana kadar bekle, sonra 5s flush buffer
         while _time.time() < _deadline:
             if os.path.isfile(op2_path) and os.path.getsize(op2_path) > 0:
-                _time.sleep(2.0)
+                _time.sleep(5.0)
                 break
             _time.sleep(0.5)
 
@@ -508,20 +534,14 @@ def solve_and_evaluate(nastran_exe, bdf_path, thickness_map, work_dir, log_callb
     modify_pshell_thicknesses(bdf_path, modified_bdf, thickness_map, log_callback)
 
     op2_path = run_nastran(nastran_exe, modified_bdf, work_dir, log_callback, memory_mb=memory_mb, scratch_dir=scratch_dir)
-    op2_model = _make_op2()
-    try:
-        op2_model.read_op2(op2_path)
-        # İlk başarılı okumadan referans boyutu kaydet
-        global _ref_op2_size
-        with _ref_op2_lock:
-            if _ref_op2_size == 0:
-                _sz = os.path.getsize(op2_path)
-                if _sz > 102400:   # en az 100KB — geçerli OP2
-                    _ref_op2_size = _sz
-    except AttributeError as _ae:
-        raise RuntimeError(
-            f"OP2 okunamadı — Nastran başarısız veya OP2 bozuk. Detay: {_ae}"
-        ) from _ae
+    op2_model = _read_op2_with_retry(op2_path, log_callback)
+    # İlk başarılı okumadan referans boyutu kaydet
+    global _ref_op2_size
+    with _ref_op2_lock:
+        if _ref_op2_size == 0:
+            _sz = os.path.getsize(op2_path)
+            if _sz > 102400:
+                _ref_op2_size = _sz
 
     max_disp = get_max_absolute_displacement(op2_model, direction=disp_direction)
     stress_map = get_von_mises_stresses(op2_model)
@@ -2978,13 +2998,7 @@ class NastranToolApp:
             self._log("=" * 50)
 
             op2_path = run_nastran(nastran_exe, bdf_path, output_dir, self._log)
-            op2_model = _make_op2()
-            try:
-                op2_model.read_op2(op2_path)
-            except AttributeError as _ae:
-                raise RuntimeError(
-                    f"OP2 okunamadı — Nastran başarısız veya OP2 bozuk. Detay: {_ae}"
-                ) from _ae
+            op2_model = _read_op2_with_retry(op2_path, self._log)
             extract_results_csv(op2_model, output_dir, "result", self._log)
 
             max_disp = get_max_absolute_displacement(op2_model, direction=disp_direction)
