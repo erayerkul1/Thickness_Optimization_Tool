@@ -3016,6 +3016,7 @@ class NastranToolApp:
         finally:
             self.root.after(0, self._finish)
 
+
     def _on_run(self):
         vals = self._validate_common()
         if not vals:
@@ -3348,10 +3349,6 @@ class NastranToolApp:
                 allowable_map, self._log
             )
 
-            # Scratch klasorunu temizle
-            if scratch_dir:
-                cleanup_scratch_dir(scratch_dir, self._log)
-
             self._log("\nİŞLEM TAMAMLANDI!")
             self.root.after(0, lambda: messagebox.showinfo(
                 "Optimizasyon Tamamlandı",
@@ -3366,6 +3363,11 @@ class NastranToolApp:
             self._log(f"\nHATA: {error_msg}")
             self.root.after(0, lambda msg=error_msg: messagebox.showerror("Hata", msg))
         finally:
+            if scratch_dir:
+                try:
+                    cleanup_scratch_dir(scratch_dir, self._log)
+                except Exception:
+                    pass
             self.root.after(0, self._finish)
 
 
