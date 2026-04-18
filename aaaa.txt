@@ -484,6 +484,15 @@ def solve_and_evaluate(nastran_exe, bdf_path, thickness_map, work_dir, log_callb
     max_disp = get_max_absolute_displacement(op2_model, direction=disp_direction)
     stress_map = get_von_mises_stresses(op2_model)
 
+    # Çoklu subcase: her subcase'in displacement max'ini logla
+    if op2_model.displacements and len(op2_model.displacements) > 1:
+        parts = []
+        for sc_id, d_obj in op2_model.displacements.items():
+            t = d_obj.data[:, :, :3]
+            sc_max = float(np.max(np.sqrt(np.sum(t ** 2, axis=2))))
+            parts.append(f"LC{sc_id}:{sc_max:.4f}")
+        log_callback(f"  Subcase disp → {', '.join(parts)} | toplam max={max_disp:.6f}")
+
     iter_label = os.path.basename(work_dir)
     extract_results_csv(op2_model, work_dir, iter_label, log_callback)
 
@@ -605,9 +614,107 @@ class IterationTracker:
                 best_t = self.thickness_maps[i]
         return best_t, best_mass
 
+    def get_pareto_front(self):
+        """Non-dominated çözümler: min mass AND min max_disp."""
+        n = len(self.masses)
+        pareto = []
+        for i in range(n):
+            dominated = False
+            for j in range(n):
+                if i == j:
+                    continue
+                if (self.masses[j] <= self.masses[i] and
+                        self.displacements[j] <= self.displacements[i] and
+                        (self.masses[j] < self.masses[i] or
+                         self.displacements[j] < self.displacements[i])):
+                    dominated = True
+                    break
+            if not dominated:
+                pareto.append({
+                    "mass": self.masses[i],
+                    "max_disp": self.displacements[i],
+                    "max_vm": self.stresses[i],
+                    "stress_ok": self.stress_ok_list[i],
+                    "thickness_map": self.thickness_maps[i],
+                })
+        return sorted(pareto, key=lambda x: x["mass"])
+
 
 # ---------------------------------------------------------------------------
-# ALGORİTMA 1: Forward Difference + SciPy SQP (trust-constr)
+# Surrogate Model (lineer ridge regression; sklearn GB opsiyonel)
+# ---------------------------------------------------------------------------
+
+class SurrogateModel:
+    """max_disp ve max_vm için hızlı tahmin modeli.
+    Yeterli veri yoksa predict() None döner → tam Nastran çalışır."""
+    MIN_SAMPLES = 15
+    RIDGE_ALPHA = 1e-2
+
+    def __init__(self):
+        self.X, self.y_disp, self.y_vm = [], [], []
+        self.x_mean = self.x_std = None
+        self.w_disp = self.w_vm = None
+        self.fitted = False
+        self._use_gb = False
+        try:
+            from sklearn.ensemble import GradientBoostingRegressor
+            from sklearn.preprocessing import StandardScaler
+            self._gb_d = GradientBoostingRegressor(n_estimators=60, max_depth=3, random_state=0)
+            self._gb_v = GradientBoostingRegressor(n_estimators=60, max_depth=3, random_state=0)
+            self._scaler = StandardScaler()
+            self._use_gb = True
+        except ImportError:
+            pass
+
+    def add(self, x_vec, disp_val, vm_val):
+        if disp_val >= 1e9:
+            return
+        self.X.append(np.asarray(x_vec, dtype=float))
+        self.y_disp.append(float(disp_val))
+        self.y_vm.append(float(max(vm_val, 0.0)))
+
+    def fit(self):
+        n = len(self.X)
+        if n < self.MIN_SAMPLES:
+            return False
+        X = np.array(self.X)
+        self.x_mean = X.mean(axis=0)
+        self.x_std = np.where(X.std(axis=0) > 1e-10, X.std(axis=0), 1.0)
+        Xn = (X - self.x_mean) / self.x_std
+        if self._use_gb:
+            Xs = self._scaler.fit_transform(Xn)
+            self._gb_d.fit(Xs, self.y_disp)
+            self._gb_v.fit(Xs, self.y_vm)
+        else:
+            Xb = np.hstack([np.ones((n, 1)), Xn])
+            A = Xb.T @ Xb + self.RIDGE_ALPHA * np.eye(Xb.shape[1])
+            self.w_disp = np.linalg.solve(A, Xb.T @ np.array(self.y_disp))
+            self.w_vm = np.linalg.solve(A, Xb.T @ np.array(self.y_vm))
+        self.fitted = True
+        return True
+
+    def predict_batch(self, X_batch):
+        """(n, n_features) → (pred_disp array, pred_vm array) veya (None, None)."""
+        if not self.fitted:
+            return None, None
+        Xn = (np.asarray(X_batch, dtype=float) - self.x_mean) / self.x_std
+        if self._use_gb:
+            Xs = self._scaler.transform(Xn)
+            return self._gb_d.predict(Xs), self._gb_v.predict(Xs)
+        Xb = np.hstack([np.ones((len(Xn), 1)), Xn])
+        return Xb @ self.w_disp, Xb @ self.w_vm
+
+
+def _check_convergence(fit_history, patience, tol=1e-3):
+    """Son `patience` adımda göreceli iyileşme < tol ise True döner."""
+    if len(fit_history) < patience:
+        return False
+    ref = fit_history[-patience]
+    if abs(ref) < 1e-12:
+        return False
+    return abs(ref - fit_history[-1]) / abs(ref) < tol
+
+
 # ---------------------------------------------------------------------------
 
 def optimize_fd_sqp(bdf_path, nastran_exe, output_dir, pids, allowable_map,
@@ -760,7 +867,8 @@ def optimize_genetic(bdf_path, nastran_exe, output_dir, pids, allowable_map,
                      log_callback, progress_callback, tracker, n_parallel=1, memory_mb=0,
                      pid_mid_map=None, mid_density_map=None, pid_area_map=None,
                      pid_bounds=None, stress_mode="Element Based", sigma_count=0,
-                     eid_pid_map=None, eid_area_map=None, scratch_dir=None, disp_direction="Mag", stop_event=None):
+                     eid_pid_map=None, eid_area_map=None, scratch_dir=None, disp_direction="Mag",
+                     stop_event=None, conv_patience=30):
     """Genetik Algoritma ile kalınlık optimizasyonu."""
     n = len(pids)
     eval_count = [0]
@@ -825,6 +933,7 @@ def optimize_genetic(bdf_path, nastran_exe, output_dir, pids, allowable_map,
     best_fitness = float('inf')
     best_disp = float('inf')
     best_stress = {}
+    _conv_hist_ga = []
 
     for gen in range(n_generations):
         if stop_event is not None and stop_event.is_set():
@@ -934,6 +1043,10 @@ def optimize_genetic(bdf_path, nastran_exe, output_dir, pids, allowable_map,
                      f"Mass={gen_best_mass:.4f} {mass_unit}, "
                      f"Disp={disp_results[gen_best_idx]:.6f}")
         log_callback(f"  Feasible birey: {gen_feasible_count}/{pop_size}")
+        _conv_hist_ga.append(best_fitness)
+        if _check_convergence(_conv_hist_ga, conv_patience):
+            log_callback(f"  GA: son {conv_patience} jenerasyonda iyileşme < 0.1%%, yakınsandı.")
+            break
 
         # Yeni popülasyon oluştur
         sorted_indices = np.argsort(fitness_scores)
@@ -1157,7 +1270,7 @@ def optimize_oc_sepcmaes(bdf_path, nastran_exe, output_dir, pids, allowable_map,
                           pid_bounds=None, stress_mode="Element Based", sigma_count=0,
                           eid_pid_map=None, eid_area_map=None, scratch_dir=None,
                           disp_direction="Mag", mid_E_map=None,
-                          stop_event=None):
+                          stop_event=None, conv_patience=30):
     """Hibrit OC + sep-CMA-ES optimizasyon.
 
     Faz 1 — OC: strain energy sensitivitesi ile hızlı lokal yakınsama (1 run/iter).
@@ -1279,6 +1392,7 @@ def optimize_oc_sepcmaes(bdf_path, nastran_exe, output_dir, pids, allowable_map,
     cma_best_fitness = float('inf')
     cma_best_disp    = float('inf')
     cma_best_stress  = {}
+    _conv_hist_cma   = []
 
     for cma_gen in range(cma_iters):
         if stop_event is not None and stop_event.is_set():
@@ -1359,6 +1473,10 @@ def optimize_oc_sepcmaes(bdf_path, nastran_exe, output_dir, pids, allowable_map,
         best_i = int(np.argmin(fitnesses))
         log_callback(f"  CMA Gen {cma_gen+1}/{cma_iters}: "
                      f"best_fit={fitnesses[best_i]:.4f}, sigma={cma.sigma:.4f}")
+        _conv_hist_cma.append(float(fitnesses[best_i]))
+        if _check_convergence(_conv_hist_cma, conv_patience):
+            log_callback(f"  CMA-ES: son {conv_patience} nesilde iyileşme < 0.1%%, yakınsandı.")
+            break
 
     # CMA-ES başlangıç noktası dönmüşse kullan
     if cma_best_t is None:
@@ -1404,7 +1522,7 @@ def optimize_oc(bdf_path, nastran_exe, output_dir, pids, allowable_map,
                 pid_bounds=None, stress_mode="Element Based", sigma_count=0,
                 eid_pid_map=None, eid_area_map=None, scratch_dir=None,
                 disp_direction="Mag", mid_E_map=None,
-                stop_event=None):
+                stop_event=None, conv_patience=30):
     """Standalone Optimality Criteria (OC) optimizasyonu.
 
     n=200-500 PID için seri koşturmada en verimli seçim:
@@ -1441,6 +1559,7 @@ def optimize_oc(bdf_path, nastran_exe, output_dir, pids, allowable_map,
     # Move limit: başlangıçta geniş, yakınsadıkça daralır
     prev_mass = float('inf')
     stagnation = 0
+    _conv_hist = []
 
     for it in range(max_iter):
         if stop_event is not None and stop_event.is_set():
@@ -1482,6 +1601,12 @@ def optimize_oc(bdf_path, nastran_exe, output_dir, pids, allowable_map,
             else:
                 stagnation = 0
             prev_mass = mass_now
+
+            # Yakınsama kontrolü
+            _conv_hist.append(mass_now)
+            if _check_convergence(_conv_hist, conv_patience):
+                log_callback(f"  OC: son {conv_patience} iterasyonda iyileşme < 0.1%%, yakınsandı.")
+                break
 
             # OC sensitivite + güncelleme
             sensitivities, pid_SE = compute_oc_sensitivities(
@@ -1527,7 +1652,8 @@ def optimize_lshade(bdf_path, nastran_exe, output_dir, pids, allowable_map,
                     pid_mid_map=None, mid_density_map=None, pid_area_map=None,
                     pid_bounds=None, stress_mode="Element Based", sigma_count=0,
                     eid_pid_map=None, eid_area_map=None, scratch_dir=None,
-                    disp_direction="Mag", stop_event=None):
+                    disp_direction="Mag", stop_event=None,
+                    conv_patience=30, use_surrogate=False):
     """L-SHADE: Success-History based Adaptive Differential Evolution.
 
     Standart DE'ye göre iyileştirmeler:
@@ -1634,6 +1760,21 @@ def optimize_lshade(bdf_path, nastran_exe, output_dir, pids, allowable_map,
     best_t_overall   = dict(t_maps_cur[best_idx])
     best_fit_overall = fitness[best_idx]
     archive = []
+    _conv_hist_ls = []
+
+    # Surrogate: init verisiyle fit
+    surrogate = SurrogateModel() if use_surrogate else None
+    if surrogate is not None:
+        for i, item in enumerate(results):
+            if item is not None:
+                tm, md, sm = item
+                so, _, mvm = do_stress_check(sm, allowable_map, stress_mode, sigma_count, eid_pid_map, eid_area_map)
+                surrogate.add(list(tm[p] for p in pids), md, mvm if mvm else 0.0)
+        if surrogate.fit():
+            log_callback(f"  Surrogate (sklearn={surrogate._use_gb}) init verisiyle eğitildi ({len(surrogate.X)} örnek)")
+        else:
+            log_callback("  Surrogate: yetersiz veri, devre dışı.")
+            surrogate = None
 
     # ── Ana L-SHADE döngüsü ─────────────────────────────────────────────────
     for gen in range(max_iter):
@@ -1694,30 +1835,60 @@ def optimize_lshade(bdf_path, nastran_exe, output_dir, pids, allowable_map,
 
         trial_t_maps = [_to_t_map(trials[i]) for i in range(pop_now)]
 
+        # Surrogate ön eleme: sadece en umut verici n_validate adayı Nastran ile çalıştır
+        nastran_indices = list(range(pop_now))
+        surrogate_results = {}
+        if surrogate is not None and surrogate.fitted and pop_now > n_parallel:
+            X_trials = np.array([[tm[p] for p in pids] for tm in trial_t_maps])
+            pred_d, pred_v = surrogate.predict_batch(X_trials)
+            if pred_d is not None:
+                pred_fit = np.array([_fitness(trial_t_maps[i], pred_d[i], pred_v[i] <= max(allowable_map.values(), default=1e9))
+                                     for i in range(pop_now)])
+                n_validate = max(n_parallel, pop_now // 3)
+                nastran_indices = list(np.argsort(pred_fit)[:n_validate])
+                for i in range(pop_now):
+                    if i not in nastran_indices:
+                        surrogate_results[i] = (trial_t_maps[i], float(pred_d[i]), {})
+
         if n_parallel > 1:
             batch = [(trial_t_maps[i], os.path.join(output_dir, f"lshade_g{gen+1}_i{i}"))
-                     for i in range(pop_now)]
+                     for i in nastran_indices]
             try:
-                trial_results = solve_batch(nastran_exe, bdf_path, batch, n_parallel,
-                                            log_callback, memory_mb=memory_mb,
-                                            scratch_dir=scratch_dir,
-                                            disp_direction=disp_direction)
+                real_res = solve_batch(nastran_exe, bdf_path, batch, n_parallel,
+                                       log_callback, memory_mb=memory_mb,
+                                       scratch_dir=scratch_dir,
+                                       disp_direction=disp_direction)
             except Exception as exc:
                 log_callback(f"  [Hata] L-SHADE Gen {gen+1} batch: {exc}")
-                trial_results = [(trial_t_maps[i], 1e10, {}) for i in range(pop_now)]
+                real_res = [(trial_t_maps[nastran_indices[k]], 1e10, {}) for k in range(len(nastran_indices))]
+            nastran_map = {nastran_indices[k]: real_res[k] for k in range(len(nastran_indices))}
         else:
-            trial_results = []
-            for i in range(pop_now):
+            nastran_map = {}
+            for i in nastran_indices:
                 try:
                     md, sm = solve_and_evaluate(
                         nastran_exe, bdf_path, trial_t_maps[i],
                         os.path.join(output_dir, f"lshade_g{gen+1}_i{i}"), log_callback,
                         memory_mb=memory_mb, scratch_dir=scratch_dir,
                         disp_direction=disp_direction)
-                    trial_results.append((trial_t_maps[i], md, sm))
+                    nastran_map[i] = (trial_t_maps[i], md, sm)
                 except Exception as exc:
                     log_callback(f"  [Hata] L-SHADE Gen {gen+1} Birey #{i}: {exc}")
-                    trial_results.append((trial_t_maps[i], 1e10, {}))
+                    nastran_map[i] = (trial_t_maps[i], 1e10, {})
+
+        trial_results = []
+        for i in range(pop_now):
+            if i in nastran_map:
+                trial_results.append(nastran_map[i])
+                if surrogate is not None:
+                    tm, md, sm = nastran_map[i]
+                    so, _, mvm = do_stress_check(sm, allowable_map, stress_mode, sigma_count, eid_pid_map, eid_area_map)
+                    surrogate.add([tm[p] for p in pids], md, mvm if mvm else 0.0)
+            else:
+                trial_results.append(surrogate_results.get(i, (trial_t_maps[i], 1e10, {})))
+
+        if surrogate is not None and (gen + 1) % 5 == 0:
+            surrogate.fit()
 
         for i, item in enumerate(trial_results):
             if item is None:
@@ -1763,6 +1934,10 @@ def optimize_lshade(bdf_path, nastran_exe, output_dir, pids, allowable_map,
         log_callback(f"  L-SHADE Gen {gen+1}/{max_iter}: N={pop_now}, "
                      f"best_fit={fitness[best_idx]:.4f}, "
                      f"M_F={M_F[(h_idx-1)%H]:.3f}, M_CR={M_CR[(h_idx-1)%H]:.3f}")
+        _conv_hist_ls.append(fitness[best_idx])
+        if _check_convergence(_conv_hist_ls, conv_patience):
+            log_callback(f"  L-SHADE: son {conv_patience} nesilde iyileşme < 0.1%%, yakınsandı.")
+            break
 
     log_callback(f"\n{'='*50}")
     log_callback("SON ÇÖZÜM")
@@ -1792,7 +1967,8 @@ def optimize_pso(bdf_path, nastran_exe, output_dir, pids, allowable_map,
                  pid_mid_map=None, mid_density_map=None, pid_area_map=None,
                  pid_bounds=None, stress_mode="Element Based", sigma_count=0,
                  eid_pid_map=None, eid_area_map=None, scratch_dir=None,
-                 disp_direction="Mag", stop_event=None):
+                 disp_direction="Mag", stop_event=None,
+                 conv_patience=30, use_surrogate=False):
     """PSO (Particle Swarm Optimization).
 
     - w=0.729, c1=c2=1.49445 (Clerc & Kennedy 2002 constriction factor)
@@ -1896,7 +2072,24 @@ def optimize_pso(bdf_path, nastran_exe, output_dir, pids, allowable_map,
     gbest_fit = float(pbest_fit[gbest_idx])
     best_t_overall = dict(t_maps_init[gbest_idx])
 
+    # Surrogate init
+    surrogate = SurrogateModel() if use_surrogate else None
+    if surrogate is not None:
+        for i, item in enumerate(results):
+            if item is None:
+                continue
+            _tm, _md, _sm = item
+            try:
+                _so, _, _mvm = do_stress_check(_sm, allowable_map, stress_mode, sigma_count,
+                                               eid_pid_map, eid_area_map)
+                surrogate.add([t_maps_init[i][p] for p in pids], _md, _mvm if _mvm else 0.0)
+            except Exception:
+                pass
+        if surrogate.fit():
+            log_callback(f"  Surrogate (sklearn={surrogate._use_gb}) başlangıç verisiyle eğitildi.")
+
     # ── Ana PSO döngüsü ─────────────────────────────────────────────────────
+    _conv_hist_pso = []
     for gen in range(max_iter):
         if stop_event is not None and stop_event.is_set():
             log_callback("  PSO durduruldu.")
@@ -1914,55 +2107,97 @@ def optimize_pso(bdf_path, nastran_exe, output_dir, pids, allowable_map,
 
         trial_t_maps = [_to_t_map(positions[i]) for i in range(pop_size)]
 
+        # Surrogate pre-screening: evaluate only top n_validate candidates with Nastran
+        n_validate = max(n_parallel, pop_size // 3)
+        if surrogate is not None and surrogate.fitted:
+            _X = [[trial_t_maps[i][p] for p in pids] for i in range(pop_size)]
+            _pd, _pv = surrogate.predict_batch(_X)
+            if _pd is not None:
+                _sf = np.array([_fitness(trial_t_maps[i], max(float(_pd[i]), 0.0),
+                                         float(_pd[i]) <= max_disp_limit)
+                                for i in range(pop_size)])
+                validate_set = set(np.argsort(_sf)[:n_validate].tolist())
+            else:
+                validate_set = set(range(pop_size))
+        else:
+            validate_set = set(range(pop_size))
+
+        validated_idxs = sorted(validate_set)
+
         if n_parallel > 1:
             batch = [(trial_t_maps[i], os.path.join(output_dir, f"pso_g{gen+1}_i{i}"))
-                     for i in range(pop_size)]
+                     for i in validated_idxs]
             try:
-                trial_results = solve_batch(nastran_exe, bdf_path, batch, n_parallel,
-                                            log_callback, memory_mb=memory_mb,
-                                            scratch_dir=scratch_dir,
-                                            disp_direction=disp_direction)
+                batch_res = solve_batch(nastran_exe, bdf_path, batch, n_parallel,
+                                        log_callback, memory_mb=memory_mb,
+                                        scratch_dir=scratch_dir,
+                                        disp_direction=disp_direction)
             except Exception as exc:
                 log_callback(f"  [Hata] PSO Gen {gen+1} batch: {exc}")
-                trial_results = [(trial_t_maps[i], 1e10, {}) for i in range(pop_size)]
+                batch_res = [(trial_t_maps[i], 1e10, {}) for i in validated_idxs]
+            real_results = {validated_idxs[k]: batch_res[k] for k in range(len(validated_idxs))}
         else:
-            trial_results = []
-            for i in range(pop_size):
+            real_results = {}
+            for i in validated_idxs:
                 try:
                     md, sm = solve_and_evaluate(
                         nastran_exe, bdf_path, trial_t_maps[i],
                         os.path.join(output_dir, f"pso_g{gen+1}_i{i}"), log_callback,
                         memory_mb=memory_mb, scratch_dir=scratch_dir,
                         disp_direction=disp_direction)
-                    trial_results.append((trial_t_maps[i], md, sm))
+                    real_results[i] = (trial_t_maps[i], md, sm)
                 except Exception as exc:
                     log_callback(f"  [Hata] PSO Gen {gen+1} Parçacık #{i}: {exc}")
-                    trial_results.append((trial_t_maps[i], 1e10, {}))
+                    real_results[i] = (trial_t_maps[i], 1e10, {})
 
-        for i, item in enumerate(trial_results):
-            if item is None:
-                continue
+        for i in range(pop_size):
             try:
-                t_map, max_disp, stress_map = item
-                stress_ok, _, max_vm = do_stress_check(
-                    stress_map, allowable_map, stress_mode, sigma_count,
-                    eid_pid_map, eid_area_map)
-                fit_i = _fitness(trial_t_maps[i], max_disp, stress_ok)
-                tracker.record(f"PSO_G{gen+1}_{i+1}", trial_t_maps[i], max_disp, max_vm,
-                               stress_ok, allowable_map, log_callback)
+                if i in real_results:
+                    item = real_results[i]
+                    if item is None:
+                        continue
+                    t_map, max_disp_i, stress_map_i = item
+                    stress_ok_i, _, max_vm_i = do_stress_check(
+                        stress_map_i, allowable_map, stress_mode, sigma_count,
+                        eid_pid_map, eid_area_map)
+                    fit_i = _fitness(trial_t_maps[i], max_disp_i, stress_ok_i)
+                    tracker.record(f"PSO_G{gen+1}_{i+1}", trial_t_maps[i], max_disp_i, max_vm_i,
+                                   stress_ok_i, allowable_map, log_callback)
+                    if surrogate is not None:
+                        surrogate.add([trial_t_maps[i][p] for p in pids], max_disp_i,
+                                      max_vm_i if max_vm_i else 0.0)
+                elif surrogate is not None and surrogate.fitted:
+                    _Xp = [[trial_t_maps[i][p] for p in pids]]
+                    _pd2, _ = surrogate.predict_batch(_Xp)
+                    if _pd2 is None:
+                        continue
+                    max_disp_i = max(float(_pd2[0]), 0.0)
+                    stress_ok_i = max_disp_i <= max_disp_limit
+                    fit_i = _fitness(trial_t_maps[i], max_disp_i, stress_ok_i)
+                else:
+                    continue
 
                 if fit_i < pbest_fit[i]:
                     pbest_fit[i] = fit_i
                     pbest_pos[i] = positions[i].copy()
 
                 if fit_i < gbest_fit:
-                    gbest_fit      = fit_i
-                    gbest_pos      = positions[i].copy()
-                    best_t_overall = dict(trial_t_maps[i])
+                    gbest_fit = fit_i
+                    gbest_pos = positions[i].copy()
+                    if i in real_results:
+                        best_t_overall = dict(trial_t_maps[i])
             except Exception as exc:
                 log_callback(f"  [Hata] PSO Gen {gen+1} güncelleme #{i}: {exc}")
 
+        if surrogate is not None and (gen + 1) % 5 == 0:
+            if surrogate.fit():
+                log_callback(f"  Surrogate yenilendi (n={len(surrogate.X)})")
+
         log_callback(f"  PSO Gen {gen+1}/{max_iter}: gbest_fit={gbest_fit:.4f}")
+        _conv_hist_pso.append(gbest_fit)
+        if _check_convergence(_conv_hist_pso, conv_patience):
+            log_callback(f"  PSO: son {conv_patience} nesilde iyileşme < 0.1%%, yakınsandı.")
+            break
 
     log_callback(f"\n{'='*50}")
     log_callback("SON ÇÖZÜM")
@@ -1992,7 +2227,7 @@ def optimize_spsa(bdf_path, nastran_exe, output_dir, pids, allowable_map,
                   pid_mid_map=None, mid_density_map=None, pid_area_map=None,
                   pid_bounds=None, stress_mode="Element Based", sigma_count=0,
                   eid_pid_map=None, eid_area_map=None, scratch_dir=None,
-                  disp_direction="Mag", stop_event=None):
+                  disp_direction="Mag", stop_event=None, conv_patience=30):
     """SPSA (Simultaneous Perturbation Stochastic Approximation).
 
     Her iterasyonda yalnızca 2 Nastran çalışması — n'den bağımsız.
@@ -2045,6 +2280,7 @@ def optimize_spsa(bdf_path, nastran_exe, output_dir, pids, allowable_map,
     x = (pid_min_arr + pid_max_arr) * 0.5
     best_fit       = float('inf')
     best_t_overall = _to_t_map(x)
+    _conv_hist_spsa = []
 
     # ── Ana SPSA döngüsü ─────────────────────────────────────────────────────
     for k in range(max_iter):
@@ -2099,6 +2335,10 @@ def optimize_spsa(bdf_path, nastran_exe, output_dir, pids, allowable_map,
 
         log_callback(f"  SPSA k={k+1}/{max_iter}: a_k={a_k:.5f}, c_k={c_k:.5f}, "
                      f"best_fit={best_fit:.4f}")
+        _conv_hist_spsa.append(best_fit)
+        if _check_convergence(_conv_hist_spsa, conv_patience):
+            log_callback(f"  SPSA: son {conv_patience} iterasyonda iyileşme < 0.1%%, yakınsandı.")
+            break
 
     log_callback(f"\n{'='*50}")
     log_callback("SON ÇÖZÜM")
@@ -2391,6 +2631,18 @@ class NastranToolApp:
         self.sigma_avg_btn.configure(state=tk.DISABLED)
         self.sigma_1_btn.configure(state=tk.DISABLED)
         self.sigma_2_btn.configure(state=tk.DISABLED)
+
+        ttk.Label(param_frame, text="Yakınsama Sabrı:").grid(row=7, column=0, sticky=tk.W, padx=2, pady=(4, 0))
+        self.conv_patience_entry = ttk.Entry(param_frame, width=8)
+        self.conv_patience_entry.grid(row=7, column=1, padx=2, pady=(4, 0))
+        self.conv_patience_entry.insert(0, "30")
+        ttk.Label(param_frame, text="(iter/nesil)").grid(row=7, column=2, sticky=tk.W, padx=2, pady=(4, 0))
+
+        self.use_surrogate_var = tk.BooleanVar(value=False)
+        self.use_surrogate_chk = ttk.Checkbutton(
+            param_frame, text="Surrogate Kullan (L-SHADE/PSO)",
+            variable=self.use_surrogate_var)
+        self.use_surrogate_chk.grid(row=7, column=3, columnspan=4, sticky=tk.W, padx=4, pady=(4, 0))
 
         main_frame.columnconfigure(1, weight=1)
 
@@ -2781,6 +3033,15 @@ class NastranToolApp:
         scratch_dir = self.scratch_entry.get().strip() or None
         disp_direction = self.disp_dir_var.get()
 
+        try:
+            conv_patience = int(self.conv_patience_entry.get().strip())
+            if conv_patience < 1:
+                conv_patience = 30
+        except (ValueError, AttributeError):
+            conv_patience = 30
+
+        use_surrogate = bool(self.use_surrogate_var.get())
+
         self._disable_buttons()
         self.progress.configure(mode="determinate", value=0)
 
@@ -2789,7 +3050,7 @@ class NastranToolApp:
             args=(bdf_path, nastran_exe, output_dir, excel_path,
                   min_t, max_t, step, max_disp_limit, max_iter, algo_name, n_parallel, memory_mb,
                   retain_mode, thickness_range_data, stress_mode, sigma_count, scratch_dir,
-                  disp_direction),
+                  disp_direction, conv_patience, use_surrogate),
             daemon=True,
         ).start()
 
@@ -2797,7 +3058,7 @@ class NastranToolApp:
                     min_t, max_t, step, max_disp_limit, max_iter, algo_name, n_parallel, memory_mb,
                     retain_mode="all", thickness_range_data=None,
                     stress_mode="Element Based", sigma_count=0, scratch_dir=None,
-                    disp_direction="Mag"):
+                    disp_direction="Mag", conv_patience=30, use_surrogate=False):
         try:
             self._log("=" * 60)
             self._log(f"OPTİMİZASYON: {algo_name}")
@@ -2874,6 +3135,7 @@ class NastranToolApp:
                 eid_pid_map=eid_pid_map, eid_area_map=eid_area_map,
                 scratch_dir=scratch_dir, disp_direction=disp_direction,
                 stop_event=self._stop_event,
+                conv_patience=conv_patience,
             )
 
             _mass_kwargs = dict(pid_mid_map=pid_mid_map,
@@ -2888,11 +3150,11 @@ class NastranToolApp:
                 result_t, final_disp, final_stress = optimize_oc(**algo_kwargs)
 
             elif "L-SHADE" in algo_name or "Adaptive" in algo_name:
-                algo_kwargs.update(_mass_kwargs)
+                algo_kwargs.update(_mass_kwargs, use_surrogate=use_surrogate)
                 result_t, final_disp, final_stress = optimize_lshade(**algo_kwargs)
 
             elif "PSO" in algo_name or "Particle" in algo_name:
-                algo_kwargs.update(_mass_kwargs)
+                algo_kwargs.update(_mass_kwargs, use_surrogate=use_surrogate)
                 result_t, final_disp, final_stress = optimize_pso(**algo_kwargs)
 
             elif "SPSA" in algo_name or "Stochastic Gradient" in algo_name:
@@ -2984,6 +3246,15 @@ class NastranToolApp:
             t_df.to_csv(t_csv, index=False)
             self._log(f"  Kalınlık dağılımı: {t_csv}")
 
+            # Optimize edilmiş BDF export
+            try:
+                bdf_name = os.path.splitext(os.path.basename(bdf_path))[0]
+                opt_bdf_path = os.path.join(output_dir, f"optimized_{bdf_name}.bdf")
+                modify_pshell_thicknesses(bdf_path, opt_bdf_path, result_t, self._log)
+                self._log(f"  Optimize BDF: {opt_bdf_path}")
+            except Exception as _bdf_exc:
+                self._log(f"  [Uyarı] BDF export başarısız: {_bdf_exc}")
+
             # İterasyon geçmişi CSV
             hist_df = pd.DataFrame({
                 "Iteration": tracker.iterations,
@@ -2993,6 +3264,36 @@ class NastranToolApp:
             })
             hist_csv = os.path.join(output_dir, "iteration_history.csv")
             hist_df.to_csv(hist_csv, index=False)
+
+            # Pareto front CSV
+            try:
+                pareto = tracker.get_pareto_front()
+                if pareto:
+                    pareto_df = pd.DataFrame([
+                        {"Mass_kg": p["mass"], f"MaxDisp_{disp_direction}": p["max_disp"],
+                         "MaxVonMises": p["max_vm"], "Stress_OK": p["stress_ok"]}
+                        for p in pareto
+                    ])
+                    pareto_csv = os.path.join(output_dir, "pareto_front.csv")
+                    pareto_df.to_csv(pareto_csv, index=False)
+                    self._log(f"  Pareto front ({len(pareto)} nokta): {pareto_csv}")
+                    # Pareto plot
+                    try:
+                        import matplotlib.pyplot as _plt
+                        _pfig, _pax = _plt.subplots(figsize=(5, 4))
+                        _pax.scatter([p["mass"] for p in pareto],
+                                     [p[f"max_disp"] for p in pareto], c="blue", zorder=3)
+                        _pax.set_xlabel("Mass (kg)")
+                        _pax.set_ylabel(f"Max Disp ({disp_direction})")
+                        _pax.set_title("Pareto Front")
+                        _pax.grid(True, alpha=0.3)
+                        _pfig.tight_layout()
+                        _pfig.savefig(os.path.join(output_dir, "pareto_front.png"), dpi=150)
+                        _plt.close(_pfig)
+                    except Exception:
+                        pass
+            except Exception as _pf_exc:
+                self._log(f"  [Uyarı] Pareto front hesaplanamadı: {_pf_exc}")
 
             # Grafiği kaydet
             self.fig.savefig(os.path.join(output_dir, "optimization_plot.png"), dpi=150)
