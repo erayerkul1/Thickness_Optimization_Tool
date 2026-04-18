@@ -27,6 +27,10 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from pyNastran.op2.op2 import OP2
 from pyNastran.bdf.bdf import BDF
 
+# İlk başarılı OP2 dosyasından kalibrasyon yapılır; sonraki bekleme kararları buna göre verilir.
+_ref_op2_size: int = 0
+_ref_op2_lock = threading.Lock()
+
 
 class _NullWriter:
     """pyNastran binary_debug için no-op writer.
@@ -240,24 +244,40 @@ def run_nastran(nastran_exe, bdf_path, output_dir, log_callback, memory_mb=0, sc
     if result.returncode != 0:
         log_callback(f"  Nastran return code: {result.returncode}")
 
-    # OP2 dosyasının tam yazılmasını bekle (paralel koşularda NX Nastran geç flush eder)
+    # OP2 dosyasının tam yazılmasını bekle
     import time as _time
-    _deadline = _time.time() + 120  # max 120s bekle
-    _prev_size = -1
-    _stable_count = 0
-    while _time.time() < _deadline:
-        if os.path.isfile(op2_path):
-            _sz = os.path.getsize(op2_path)
-            if _sz > 0:
-                if _sz == _prev_size:
-                    _stable_count += 1
-                    if _stable_count >= 3:   # 3 ardışık kontrol = ~3s boyut değişmedi
-                        _time.sleep(0.3)     # son flush buffer'ı
-                        break
-                else:
-                    _stable_count = 0
-                    _prev_size = _sz
-        _time.sleep(1.0)
+    global _ref_op2_size
+    if _ref_op2_size > 0:
+        # Referans boyut biliniyorsa: boyut >= %95 olunca hazır say
+        _threshold = int(_ref_op2_size * 0.95)
+        _deadline = _time.time() + 120
+        while _time.time() < _deadline:
+            if os.path.isfile(op2_path) and os.path.getsize(op2_path) >= _threshold:
+                _time.sleep(0.2)
+                break
+            _time.sleep(0.5)
+    else:
+        # İlk çözüm — boyut stabilizasyonuyla kalibre et, referansı kaydet
+        _deadline = _time.time() + 120
+        _prev_size = -1
+        _stable_count = 0
+        while _time.time() < _deadline:
+            if os.path.isfile(op2_path):
+                _sz = os.path.getsize(op2_path)
+                if _sz > 0:
+                    if _sz == _prev_size:
+                        _stable_count += 1
+                        if _stable_count >= 3:
+                            _time.sleep(0.3)
+                            with _ref_op2_lock:
+                                if _ref_op2_size == 0:
+                                    _ref_op2_size = _sz
+                                    log_callback(f"  [Kalibrasyon] Referans OP2 boyutu: {_sz:,} bayt")
+                            break
+                    else:
+                        _stable_count = 0
+                        _prev_size = _sz
+            _time.sleep(1.0)
 
     if not os.path.isfile(op2_path):
         raise FileNotFoundError(
@@ -3071,6 +3091,8 @@ class NastranToolApp:
                     stress_mode="Element Based", sigma_count=0, scratch_dir=None,
                     disp_direction="Mag", conv_patience=30, use_surrogate=False):
         try:
+            global _ref_op2_size
+            _ref_op2_size = 0   # her optimizasyon başında kalibrasyonu sıfırla
             self._log("=" * 60)
             self._log(f"OPTİMİZASYON: {algo_name}")
             if thickness_range_data:
