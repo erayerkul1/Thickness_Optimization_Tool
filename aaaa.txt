@@ -1342,23 +1342,27 @@ def oc_update_step(thickness_map, sensitivities, pid_SE, pid_bounds,
         ratio = np.where(tn > 1e-10, t_arr / tn, 1.0)
         return max_disp * float((SE_arr * ratio).sum() / SE_total)
 
-    # Lambda sınırlarını bul
-    lam_lo = 1e-10
-    lam_hi = max(float(B_arr.max()) * 10.0, 1.0)
-    for _ in range(60):
-        if u_pred(lam_hi) <= max_disp_limit:
-            break
-        lam_hi *= 2.0
+    # Kısıt mevcut max kalınlık artışıyla (move_limit) bile sağlanamıyorsa → max'a it
+    if u_pred(1e-10) > max_disp_limit:
+        t_new = t_new_fn(1e-10)
+    else:
+        # lam_hi: u_pred > limit olan infeasible üst sınır
+        lam_lo = 1e-10
+        lam_hi = max(float(B_arr.max()) * 10.0, 1.0)
+        for _ in range(60):
+            if u_pred(lam_hi) > max_disp_limit:
+                break
+            lam_hi *= 2.0
 
-    # Bisection
-    for _ in range(60):
-        lam_mid = 0.5 * (lam_lo + lam_hi)
-        if u_pred(lam_mid) > max_disp_limit:
-            lam_lo = lam_mid
-        else:
-            lam_hi = lam_mid
+        # Bisection: en büyük feasible lambda = minimum kütle
+        for _ in range(60):
+            lam_mid = 0.5 * (lam_lo + lam_hi)
+            if u_pred(lam_mid) <= max_disp_limit:
+                lam_lo = lam_mid   # kısıt sağlandı → lambda artır (kütle azalt)
+            else:
+                lam_hi = lam_mid   # kısıt ihlali → lambda azalt
 
-    t_new = t_new_fn(0.5 * (lam_lo + lam_hi))
+        t_new = t_new_fn(lam_lo)
     t_rounded = np.round(np.round(t_new / np.maximum(tstep_arr, 1e-10)) * tstep_arr, 1)
     t_rounded = np.clip(t_rounded, tmin_arr, tmax_arr)
     return {pids_list[i]: float(t_rounded[i]) for i in range(len(pids_list))}
@@ -1475,7 +1479,8 @@ def optimize_oc_sepcmaes(bdf_path, nastran_exe, output_dir, pids, allowable_map,
     pop_size = max(n_parallel, 4 + int(3.0 * np.log(max(n, 2))))
 
     log_callback(f"\n  OC + sep-CMA-ES Hibrit — {n} PSHELL, Paralel: {n_parallel}")
-    log_callback(f"  Faz 1 (OC): {oc_iters} iterasyon  |  Faz 2 (CMA-ES): {cma_iters} nesil, pop={pop_size}")
+    log_callback(f"  Faz 1 (OC): {oc_iters} seri iterasyon (1 Nastran/iter) — Paralel çalışma YOK")
+    log_callback(f"  Faz 2 (CMA-ES): {cma_iters} nesil, pop={pop_size} — Paralel çalışma: {n_parallel} eş zamanlı")
 
     def _fitness(t_map, max_disp_val, stress_ok_val):
         mass, _ = compute_real_mass(t_map, pid_mid_map, mid_density_map, pid_area_map)
