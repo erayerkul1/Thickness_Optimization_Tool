@@ -41,6 +41,15 @@ class _NullWriter:
         return lambda *a, **kw: None
 
 
+# PyInstaller --windowed exe'lerde sys.stdout/stderr None olur;
+# cpylog (pyNastran logger) stdout'a yazmaya çalışınca AttributeError alırız.
+import sys as _sys
+if _sys.stdout is None:
+    _sys.stdout = _NullWriter()
+if _sys.stderr is None:
+    _sys.stderr = _NullWriter()
+
+
 _pynastran_patched_ids: set = set()   # bir kez patch edilen sınıflar
 
 
