@@ -50,6 +50,44 @@ if _sys.stderr is None:
     _sys.stderr = _NullWriter()
 
 
+def _patch_cpylog():
+    """cpylog.screen_utils.write_screen'i güvenli hale getirir.
+
+    cpylog import sırasında sys.stdout referansını kaydeder (_STDOUT = sys.stdout).
+    Eğer o anda stdout None ise (windowed exe veya thread başlatma sırasında),
+    sonraki tüm write_screen çağrıları AttributeError verir.
+    Surrogate etkin olduğunda sklearn import'u farklı bir iş parçacığında
+    cpylog'u bu hatalı durumda tetikleyebilir.
+    """
+    try:
+        import cpylog.screen_utils as _csu
+        _orig_ws = _csu.write_screen
+        def _safe_write_screen(*a, **kw):
+            try:
+                _orig_ws(*a, **kw)
+            except (AttributeError, TypeError, OSError):
+                pass
+        _csu.write_screen = _safe_write_screen
+    except Exception:
+        pass
+    # stdout_logging fonksiyonunu da güvenceye al (cpylog iç fonksiyonu)
+    try:
+        import cpylog as _cpylog
+        for _attr in ('stdout_logging', 'write_screen'):
+            _fn = getattr(_cpylog, _attr, None)
+            if _fn is None:
+                continue
+            def _safe_fn(*a, _f=_fn, **kw):
+                try:
+                    return _f(*a, **kw)
+                except (AttributeError, TypeError, OSError):
+                    pass
+            setattr(_cpylog, _attr, _safe_fn)
+    except Exception:
+        pass
+
+_patch_cpylog()  # modül yüklenince bir kez çalışır
+
 _pynastran_patched_ids: set = set()   # bir kez patch edilen sınıflar
 
 
@@ -128,6 +166,7 @@ def _read_op2_with_retry(op2_path, log_callback, max_attempts=3, wait_sec=1.0):
     import traceback as _tb_mod
     last_exc = None
     for attempt in range(1, max_attempts + 1):
+        _patch_cpylog()                    # cpylog lazy-import sonrası da güvenli olsun
         _patch_pynastran_binary_debug()   # lazy-import edilen sınıflar da yakalanır
         m = _make_op2()
         try:
@@ -351,19 +390,29 @@ def run_nastran(nastran_exe, bdf_path, output_dir, log_callback, memory_mb=0, sc
     if result.returncode != 0:
         log_callback(f"  Nastran return code: {result.returncode}")
 
-    # OP2 dosyasının tam yazılmasını bekle (max 120s)
+    # OP2 dosyasının tam yazılmasını bekle
     import time as _time
     global _ref_op2_size
-    _deadline = _time.time() + 120
+
     if _ref_op2_size > 0:
-        # Referans boyut biliniyorsa: boyut >= %90 olunca hazır say
-        _threshold = int(_ref_op2_size * 0.90)
-        while _time.time() < _deadline:
-            if os.path.isfile(op2_path) and os.path.getsize(op2_path) >= _threshold:
-                break
+        # Referans boyut biliniyorsa iki aşamalı bekleme:
+        #   Aşama 1 — dosya görünene kadar max 90s bekle; görünmezse Nastran çökmüş demektir
+        #   Aşama 2 — boyut >= %90 referans olana kadar max 300s toplam bekle
+        _threshold  = int(_ref_op2_size * 0.90)
+        _appear_by  = _time.time() + 90
+        _full_by    = _time.time() + 300
+        _appeared   = False
+        while _time.time() < _full_by:
+            if os.path.isfile(op2_path):
+                _appeared = True
+                if os.path.getsize(op2_path) >= _threshold:
+                    break
+            elif not _appeared and _time.time() > _appear_by:
+                break   # 90s geçti, dosya hâlâ yok → Nastran başarısız
             _time.sleep(0.5)
     else:
-        # Referans bilinmiyor — dosya oluşana kadar bekle, sonra 5s flush buffer
+        # Referans bilinmiyor — dosya görünene kadar bekle, sonra 5s flush buffer
+        _deadline = _time.time() + 120
         while _time.time() < _deadline:
             if os.path.isfile(op2_path) and os.path.getsize(op2_path) > 0:
                 _time.sleep(5.0)
