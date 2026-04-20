@@ -101,8 +101,10 @@ class _SafeOP2(OP2):
 
 
 def _make_op2():
-    m = _SafeOP2(debug=False, mode='nx')
-    m.binary_debug = _NullWriter()
+    import tempfile as _tf
+    _dbg = _tf.mktemp(suffix='.op2_dbg')   # pyNastran bu dosyayı açar → binary_debug asla None olmaz
+    m = _SafeOP2(debug=False, debug_file=_dbg, mode='nx')
+    m._dbg_path = _dbg
     if m.log is None:
         _l = _logging.getLogger('pynastran_null')
         if not _l.handlers:
@@ -111,28 +113,38 @@ def _make_op2():
     return m
 
 
-def _read_op2_with_retry(op2_path, log_callback, max_attempts=5, wait_sec=5.0):
-    """OP2 okumayı birkaç kez dener; her denemede yeni _SafeOP2 nesnesi kullanır.
-
-    Nastran yavaş flush eden dosya sistemlerinde (ağ sürücüsü vb.) veya
-    pyNastran iç nesnelerinde geçici hata olduğunda otomatik düzelir.
-    """
+def _read_op2_with_retry(op2_path, log_callback, max_attempts=3, wait_sec=1.0):
+    """OP2 okumayı birkaç kez dener; her denemede yeni _SafeOP2 nesnesi kullanır."""
     import time as _time
+    import traceback as _tb_mod
     last_exc = None
     for attempt in range(1, max_attempts + 1):
+        _patch_pynastran_binary_debug()   # lazy-import edilen sınıflar da yakalanır
+        m = _make_op2()
         try:
-            _patch_pynastran_binary_debug()   # lazy-import edilen sınıflar da yakalanır
-            m = _make_op2()
             m.read_op2(op2_path)
             return m
         except Exception as _exc:
             last_exc = _exc
+            _full_tb = _tb_mod.format_exc()
             if attempt < max_attempts:
                 log_callback(
                     f"  OP2 okuma denemesi {attempt}/{max_attempts} başarısız "
-                    f"({_exc}), {wait_sec:.0f}s bekleniyor..."
+                    f"({_exc}), {wait_sec:.0f}s bekleniyor...\n{_full_tb}"
                 )
                 _time.sleep(wait_sec)
+            else:
+                log_callback(
+                    f"  OP2 okuma denemesi {attempt}/{max_attempts} başarısız "
+                    f"({_exc})\n{_full_tb}"
+                )
+        finally:
+            _dbg = getattr(m, '_dbg_path', None)
+            if _dbg:
+                try:
+                    os.remove(_dbg)
+                except OSError:
+                    pass
     raise RuntimeError(
         f"OP2 okunamadı — {max_attempts} deneme sonuç vermedi. Son hata: {last_exc}"
     ) from last_exc
