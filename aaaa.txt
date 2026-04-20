@@ -390,19 +390,29 @@ def run_nastran(nastran_exe, bdf_path, output_dir, log_callback, memory_mb=0, sc
     if result.returncode != 0:
         log_callback(f"  Nastran return code: {result.returncode}")
 
-    # OP2 dosyasının tam yazılmasını bekle (max 120s)
+    # OP2 dosyasının tam yazılmasını bekle
     import time as _time
     global _ref_op2_size
-    _deadline = _time.time() + 120
+
     if _ref_op2_size > 0:
-        # Referans boyut biliniyorsa: boyut >= %90 olunca hazır say
-        _threshold = int(_ref_op2_size * 0.90)
-        while _time.time() < _deadline:
-            if os.path.isfile(op2_path) and os.path.getsize(op2_path) >= _threshold:
-                break
+        # Referans boyut biliniyorsa iki aşamalı bekleme:
+        #   Aşama 1 — dosya görünene kadar max 90s bekle; görünmezse Nastran çökmüş demektir
+        #   Aşama 2 — boyut >= %90 referans olana kadar max 300s toplam bekle
+        _threshold  = int(_ref_op2_size * 0.90)
+        _appear_by  = _time.time() + 90
+        _full_by    = _time.time() + 300
+        _appeared   = False
+        while _time.time() < _full_by:
+            if os.path.isfile(op2_path):
+                _appeared = True
+                if os.path.getsize(op2_path) >= _threshold:
+                    break
+            elif not _appeared and _time.time() > _appear_by:
+                break   # 90s geçti, dosya hâlâ yok → Nastran başarısız
             _time.sleep(0.5)
     else:
-        # Referans bilinmiyor — dosya oluşana kadar bekle, sonra 5s flush buffer
+        # Referans bilinmiyor — dosya görünene kadar bekle, sonra 5s flush buffer
+        _deadline = _time.time() + 120
         while _time.time() < _deadline:
             if os.path.isfile(op2_path) and os.path.getsize(op2_path) > 0:
                 _time.sleep(5.0)
