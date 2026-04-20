@@ -1342,23 +1342,27 @@ def oc_update_step(thickness_map, sensitivities, pid_SE, pid_bounds,
         ratio = np.where(tn > 1e-10, t_arr / tn, 1.0)
         return max_disp * float((SE_arr * ratio).sum() / SE_total)
 
-    # Lambda sınırlarını bul
-    lam_lo = 1e-10
-    lam_hi = max(float(B_arr.max()) * 10.0, 1.0)
-    for _ in range(60):
-        if u_pred(lam_hi) <= max_disp_limit:
-            break
-        lam_hi *= 2.0
+    # Kısıt mevcut max kalınlık artışıyla (move_limit) bile sağlanamıyorsa → max'a it
+    if u_pred(1e-10) > max_disp_limit:
+        t_new = t_new_fn(1e-10)
+    else:
+        # lam_hi: u_pred > limit olan infeasible üst sınır
+        lam_lo = 1e-10
+        lam_hi = max(float(B_arr.max()) * 10.0, 1.0)
+        for _ in range(60):
+            if u_pred(lam_hi) > max_disp_limit:
+                break
+            lam_hi *= 2.0
 
-    # Bisection
-    for _ in range(60):
-        lam_mid = 0.5 * (lam_lo + lam_hi)
-        if u_pred(lam_mid) > max_disp_limit:
-            lam_lo = lam_mid
-        else:
-            lam_hi = lam_mid
+        # Bisection: en büyük feasible lambda = minimum kütle
+        for _ in range(60):
+            lam_mid = 0.5 * (lam_lo + lam_hi)
+            if u_pred(lam_mid) <= max_disp_limit:
+                lam_lo = lam_mid   # kısıt sağlandı → lambda artır (kütle azalt)
+            else:
+                lam_hi = lam_mid   # kısıt ihlali → lambda azalt
 
-    t_new = t_new_fn(0.5 * (lam_lo + lam_hi))
+        t_new = t_new_fn(lam_lo)
     t_rounded = np.round(np.round(t_new / np.maximum(tstep_arr, 1e-10)) * tstep_arr, 1)
     t_rounded = np.clip(t_rounded, tmin_arr, tmax_arr)
     return {pids_list[i]: float(t_rounded[i]) for i in range(len(pids_list))}
@@ -1475,7 +1479,8 @@ def optimize_oc_sepcmaes(bdf_path, nastran_exe, output_dir, pids, allowable_map,
     pop_size = max(n_parallel, 4 + int(3.0 * np.log(max(n, 2))))
 
     log_callback(f"\n  OC + sep-CMA-ES Hibrit — {n} PSHELL, Paralel: {n_parallel}")
-    log_callback(f"  Faz 1 (OC): {oc_iters} iterasyon  |  Faz 2 (CMA-ES): {cma_iters} nesil, pop={pop_size}")
+    log_callback(f"  Faz 1 (OC): {oc_iters} seri iterasyon (1 Nastran/iter) — Paralel çalışma YOK")
+    log_callback(f"  Faz 2 (CMA-ES): {cma_iters} nesil, pop={pop_size} — Paralel çalışma: {n_parallel} eş zamanlı")
 
     def _fitness(t_map, max_disp_val, stress_ok_val):
         mass, _ = compute_real_mass(t_map, pid_mid_map, mid_density_map, pid_area_map)
@@ -2726,10 +2731,11 @@ class NastranToolApp:
                                       values=["Mag", "X", "Y", "Z"], state="readonly", width=5)
         disp_dir_combo.grid(row=1, column=3, padx=2, pady=(4, 0), sticky=tk.W)
 
-        ttk.Label(param_frame, text="Max Iter:").grid(row=1, column=4, sticky=tk.W, padx=2, pady=(4, 0))
+        self.max_iter_label_var = tk.StringVar(value="Max Iter (Önerilen: 500):")
+        ttk.Label(param_frame, textvariable=self.max_iter_label_var).grid(row=1, column=4, sticky=tk.W, padx=2, pady=(4, 0))
         self.max_iter_entry = ttk.Entry(param_frame, width=8)
         self.max_iter_entry.grid(row=1, column=5, padx=2, pady=(4, 0))
-        self.max_iter_entry.insert(0, "20")
+        self.max_iter_entry.insert(0, "500")
 
         ttk.Label(param_frame, text="Paralel Run:").grid(row=1, column=6, sticky=tk.W, padx=2, pady=(4, 0))
         self.n_parallel_entry = ttk.Entry(param_frame, width=8)
@@ -2807,8 +2813,9 @@ class NastranToolApp:
         ttk.Label(param_frame, text="Yakınsama Sabrı:").grid(row=7, column=0, sticky=tk.W, padx=2, pady=(4, 0))
         self.conv_patience_entry = ttk.Entry(param_frame, width=8)
         self.conv_patience_entry.grid(row=7, column=1, padx=2, pady=(4, 0))
-        self.conv_patience_entry.insert(0, "30")
-        ttk.Label(param_frame, text="(iter/nesil)").grid(row=7, column=2, sticky=tk.W, padx=2, pady=(4, 0))
+        self.conv_patience_entry.insert(0, "50")
+        self.patience_hint_var = tk.StringVar(value="(Önerilen: 50)")
+        ttk.Label(param_frame, textvariable=self.patience_hint_var).grid(row=7, column=2, sticky=tk.W, padx=2, pady=(4, 0))
 
         self.use_surrogate_var = tk.BooleanVar(value=False)
         self.use_surrogate_chk = ttk.Checkbutton(
@@ -2879,6 +2886,28 @@ class NastranToolApp:
             self.n_parallel_entry.insert(0, "1")
         else:
             self.n_parallel_entry.configure(state=tk.NORMAL)
+
+        # Algoritma bazlı önerilen max_iter ve patience değerleri
+        _defaults = {
+            "OC + sep-CMA-ES": (500,  50),
+            "OC Standalone":   (150,  20),
+            "L-SHADE":         (300,  40),
+            "PSO":             (300,  40),
+            "SPSA":            (500,  50),
+            "Genetic":         (100,  20),
+            "FD + SQP":        (50,   10),
+        }
+        rec_iter, rec_pat = 500, 50
+        for key, vals in _defaults.items():
+            if key in algo:
+                rec_iter, rec_pat = vals
+                break
+        self.max_iter_entry.delete(0, tk.END)
+        self.max_iter_entry.insert(0, str(rec_iter))
+        self.max_iter_label_var.set(f"Max Iter (Önerilen: {rec_iter}):")
+        self.conv_patience_entry.delete(0, tk.END)
+        self.conv_patience_entry.insert(0, str(rec_pat))
+        self.patience_hint_var.set(f"(Önerilen: {rec_pat})")
 
     def _on_stress_mode_changed(self, event=None):
         """Stress modu degistiginde sigma butonlarini aktif/deaktif yap."""
