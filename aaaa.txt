@@ -2885,6 +2885,26 @@ class NastranToolApp:
         else:
             self.n_parallel_entry.configure(state=tk.NORMAL)
 
+        # Algoritma bazlı önerilen max_iter ve patience değerleri
+        _defaults = {
+            "OC + sep-CMA-ES": (500,  50),
+            "OC Standalone":   (150,  20),
+            "L-SHADE":         (300,  40),
+            "PSO":             (300,  40),
+            "SPSA":            (500,  50),
+            "Genetic":         (100,  20),
+            "FD + SQP":        (50,   10),
+        }
+        rec_iter, rec_pat = 500, 50
+        for key, vals in _defaults.items():
+            if key in algo:
+                rec_iter, rec_pat = vals
+                break
+        self.max_iter_entry.delete(0, tk.END)
+        self.max_iter_entry.insert(0, str(rec_iter))
+        self.conv_patience_entry.delete(0, tk.END)
+        self.conv_patience_entry.insert(0, str(rec_pat))
+
     def _on_stress_mode_changed(self, event=None):
         """Stress modu degistiginde sigma butonlarini aktif/deaktif yap."""
         if self.stress_mode_var.get() == "Average Stress":
