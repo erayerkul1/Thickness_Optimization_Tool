@@ -41,6 +41,45 @@ class _NullWriter:
         return lambda *a, **kw: None
 
 
+_pynastran_patched_ids: set = set()   # bir kez patch edilen sınıflar
+
+
+def _patch_pynastran_binary_debug():
+    """O ana kadar yüklenmiş tüm pyNastran sınıflarına binary_debug=None guard ekler.
+
+    _SafeOP2 yalnızca ana OP2 nesnesini korur. pyNastran read_op2() içinde
+    oluşturduğu iç okuyucu nesneleri (Op2Reader vb.) bağımsız olarak
+    self.binary_debug = None yapabilir. Bu fonksiyon sys.modules üzerinden
+    tüm pyNastran sınıflarını tarar ve __setattr__ override ile None atamasını
+    _NullWriter() ile değiştirir. Her sınıf yalnızca bir kez patch edilir.
+    """
+    import sys
+    global _pynastran_patched_ids
+    for _mod in list(sys.modules.values()):
+        _mname = getattr(_mod, '__name__', '') or ''
+        if not _mname.startswith('pyNastran'):
+            continue
+        for _cls in list(vars(_mod).values()):
+            if not isinstance(_cls, type):
+                continue
+            if id(_cls) in _pynastran_patched_ids:
+                continue
+            _pynastran_patched_ids.add(id(_cls))
+            if '__setattr__' in vars(_cls):
+                continue   # zaten özel __setattr__ var, dokunma
+            try:
+                _orig_sa = _cls.__setattr__
+                def _mk(_o=_orig_sa):
+                    def _sa(self, _n, _v):
+                        if _n == 'binary_debug' and _v is None:
+                            _v = _NullWriter()
+                        _o(self, _n, _v)
+                    return _sa
+                _cls.__setattr__ = _mk()
+            except TypeError:
+                pass
+
+
 class _SafeOP2(OP2):
     """binary_debug setter/deleter'ı None/silme işlemini engeller.
 
@@ -82,6 +121,7 @@ def _read_op2_with_retry(op2_path, log_callback, max_attempts=5, wait_sec=5.0):
     last_exc = None
     for attempt in range(1, max_attempts + 1):
         try:
+            _patch_pynastran_binary_debug()   # lazy-import edilen sınıflar da yakalanır
             m = _make_op2()
             m.read_op2(op2_path)
             return m
