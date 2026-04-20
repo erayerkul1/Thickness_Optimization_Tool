@@ -2731,10 +2731,11 @@ class NastranToolApp:
                                       values=["Mag", "X", "Y", "Z"], state="readonly", width=5)
         disp_dir_combo.grid(row=1, column=3, padx=2, pady=(4, 0), sticky=tk.W)
 
-        ttk.Label(param_frame, text="Max Iter:").grid(row=1, column=4, sticky=tk.W, padx=2, pady=(4, 0))
+        self.max_iter_label_var = tk.StringVar(value="Max Iter (Önerilen: 500):")
+        ttk.Label(param_frame, textvariable=self.max_iter_label_var).grid(row=1, column=4, sticky=tk.W, padx=2, pady=(4, 0))
         self.max_iter_entry = ttk.Entry(param_frame, width=8)
         self.max_iter_entry.grid(row=1, column=5, padx=2, pady=(4, 0))
-        self.max_iter_entry.insert(0, "20")
+        self.max_iter_entry.insert(0, "500")
 
         ttk.Label(param_frame, text="Paralel Run:").grid(row=1, column=6, sticky=tk.W, padx=2, pady=(4, 0))
         self.n_parallel_entry = ttk.Entry(param_frame, width=8)
@@ -2812,8 +2813,9 @@ class NastranToolApp:
         ttk.Label(param_frame, text="Yakınsama Sabrı:").grid(row=7, column=0, sticky=tk.W, padx=2, pady=(4, 0))
         self.conv_patience_entry = ttk.Entry(param_frame, width=8)
         self.conv_patience_entry.grid(row=7, column=1, padx=2, pady=(4, 0))
-        self.conv_patience_entry.insert(0, "30")
-        ttk.Label(param_frame, text="(iter/nesil)").grid(row=7, column=2, sticky=tk.W, padx=2, pady=(4, 0))
+        self.conv_patience_entry.insert(0, "50")
+        self.patience_hint_var = tk.StringVar(value="(Önerilen: 50)")
+        ttk.Label(param_frame, textvariable=self.patience_hint_var).grid(row=7, column=2, sticky=tk.W, padx=2, pady=(4, 0))
 
         self.use_surrogate_var = tk.BooleanVar(value=False)
         self.use_surrogate_chk = ttk.Checkbutton(
@@ -2902,8 +2904,10 @@ class NastranToolApp:
                 break
         self.max_iter_entry.delete(0, tk.END)
         self.max_iter_entry.insert(0, str(rec_iter))
+        self.max_iter_label_var.set(f"Max Iter (Önerilen: {rec_iter}):")
         self.conv_patience_entry.delete(0, tk.END)
         self.conv_patience_entry.insert(0, str(rec_pat))
+        self.patience_hint_var.set(f"(Önerilen: {rec_pat})")
 
     def _on_stress_mode_changed(self, event=None):
         """Stress modu degistiginde sigma butonlarini aktif/deaktif yap."""
