@@ -396,11 +396,11 @@ def run_nastran(nastran_exe, bdf_path, output_dir, log_callback, memory_mb=0, sc
 
     if _ref_op2_size > 0:
         # Referans boyut biliniyorsa iki aşamalı bekleme:
-        #   Aşama 1 — dosya görünene kadar max 90s bekle; görünmezse Nastran çökmüş demektir
-        #   Aşama 2 — boyut >= %90 referans olana kadar max 300s toplam bekle
+        #   Aşama 1 — dosya görünene kadar max 180s bekle (paralel yük altında daha uzun sürebilir)
+        #   Aşama 2 — boyut >= %90 referans olana kadar max 600s toplam bekle
         _threshold  = int(_ref_op2_size * 0.90)
-        _appear_by  = _time.time() + 90
-        _full_by    = _time.time() + 300
+        _appear_by  = _time.time() + 180
+        _full_by    = _time.time() + 600
         _appeared   = False
         while _time.time() < _full_by:
             if os.path.isfile(op2_path):
@@ -408,11 +408,11 @@ def run_nastran(nastran_exe, bdf_path, output_dir, log_callback, memory_mb=0, sc
                 if os.path.getsize(op2_path) >= _threshold:
                     break
             elif not _appeared and _time.time() > _appear_by:
-                break   # 90s geçti, dosya hâlâ yok → Nastran başarısız
+                break   # 180s geçti, dosya hâlâ yok → Nastran başarısız
             _time.sleep(0.5)
     else:
         # Referans bilinmiyor — dosya görünene kadar bekle, sonra 5s flush buffer
-        _deadline = _time.time() + 120
+        _deadline = _time.time() + 180
         while _time.time() < _deadline:
             if os.path.isfile(op2_path) and os.path.getsize(op2_path) > 0:
                 _time.sleep(5.0)
@@ -773,8 +773,8 @@ class IterationTracker:
         if self.iter_file is not None:
             try:
                 self.iter_file.write(
-                    f"{len(self.iterations)}\t{iteration_label}\t"
-                    f"{total_mass:.6f}\t{max_disp:.6f}\t{max_vm:.2f}\t"
+                    f"{len(self.iterations):>6}  {iteration_label:<22}  "
+                    f"{total_mass:>12.6f}  {max_disp:>12.6f}  {max_vm:>12.2f}  "
                     f"{'OK' if stress_ok else 'FAIL'}\n"
                 )
                 self.iter_file.flush()
@@ -1870,8 +1870,8 @@ def optimize_lshade(bdf_path, nastran_exe, output_dir, pids, allowable_map,
 
     H      = 50
     p_frac = 0.11
-    N_init = max(n_parallel, min(50, max(15, n // 4)))
-    N_min  = max(4, n_parallel)
+    N_init = max(n_parallel, min(100, max(20, n // 4)))  # en az n_parallel, problem boyutuna gore
+    N_min  = max(4, n_parallel // 4)                     # LPSR: n_parallel'in ~%25'ine kadar kucul
 
     M_F  = np.full(H, 0.5)
     M_CR = np.full(H, 0.5)
@@ -2747,23 +2747,16 @@ class NastranToolApp:
         self.max_iter_entry.grid(row=1, column=5, padx=2, pady=(4, 0))
         self.max_iter_entry.insert(0, "500")
 
-        ttk.Label(param_frame, text="Paralel Run:").grid(row=1, column=6, sticky=tk.W, padx=2, pady=(4, 0))
-        self.n_parallel_entry = ttk.Entry(param_frame, width=8)
-        self.n_parallel_entry.grid(row=1, column=7, padx=2, pady=(4, 0))
-        self.n_parallel_entry.insert(0, "1")
-
         ttk.Label(param_frame, text="Memory (MB):").grid(row=2, column=0, sticky=tk.W, padx=2, pady=(4, 0))
         self.memory_entry = ttk.Entry(param_frame, width=8)
         self.memory_entry.grid(row=2, column=1, padx=2, pady=(4, 0))
         self.memory_entry.insert(0, "0")
         ttk.Label(param_frame, text="(0 = varsayılan)").grid(row=2, column=2, sticky=tk.W, padx=2, pady=(4, 0))
 
-        ttk.Label(param_frame, text="Total Run:").grid(row=2, column=3, sticky=tk.W, padx=2, pady=(4, 0))
-        self.total_run_var = tk.StringVar(value="-")
-        ttk.Label(param_frame, textvariable=self.total_run_var, width=8,
-                  relief="sunken", anchor=tk.CENTER).grid(row=2, column=4, padx=2, pady=(4, 0))
-        ttk.Button(param_frame, text="Hesapla", width=8,
-                   command=self._calc_total_run).grid(row=2, column=5, padx=2, pady=(4, 0))
+        ttk.Label(param_frame, text="Paralel Run:").grid(row=2, column=3, sticky=tk.W, padx=(8, 2), pady=(4, 0))
+        self.n_parallel_entry = ttk.Entry(param_frame, width=8)
+        self.n_parallel_entry.grid(row=2, column=4, padx=2, pady=(4, 0))
+        self.n_parallel_entry.insert(0, "1")
 
         ttk.Label(param_frame, text="Algoritma:").grid(row=3, column=0, sticky=tk.W, padx=2, pady=(4, 0))
         self.algo_var = tk.StringVar()
@@ -3037,96 +3030,6 @@ class NastranToolApp:
     def _set_progress(self, value):
         self.root.after(0, lambda v=value: self.progress.configure(value=v))
 
-    def _calc_total_run(self):
-        # BDF dosyasından n_pids al
-        bdf_path = self.bdf_entry.get().strip()
-        if not bdf_path or not os.path.isfile(bdf_path):
-            messagebox.showerror("Hata", "Total Run hesabı için BDF dosyası gereklidir.")
-            return
-
-        try:
-            min_t = float(self.min_t_entry.get().strip())
-            max_t = float(self.max_t_entry.get().strip())
-            step = float(self.step_entry.get().strip())
-            max_iter = int(self.max_iter_entry.get().strip())
-            if step <= 0 or min_t >= max_t:
-                messagebox.showerror("Hata", "Min < Max ve Step > 0 olmalıdır.")
-                return
-        except ValueError:
-            messagebox.showerror("Hata", "Parametre değerleri sayısal olmalıdır.")
-            return
-
-        algo_name = self.algo_var.get()
-
-        # BDF'den PSHELL sayısını oku
-        try:
-            self._log("BDF okunuyor (PSHELL sayısı için)...")
-            pids, _, _, _, _, _, _ = read_bdf_model(bdf_path)
-            n_pids = len(pids)
-            if n_pids == 0:
-                messagebox.showerror("Hata", "BDF dosyasında PSHELL bulunamadı.")
-                return
-            self._log(f"  {n_pids} PSHELL bulundu.")
-        except Exception as exc:
-            messagebox.showerror("Hata", f"BDF okuma hatası: {exc}")
-            return
-
-        # Thickness aralığına göre yardımcı değerler
-        import math
-        t_range = max_t - min_t
-        n_steps = int(round(t_range / step))  # bir PSHELL'in max-min arası adım sayısı
-
-        # Algoritma bazlı tahmini run hesabı
-        if "FD" in algo_name or "SQP" in algo_name:
-            total_run = (1 + n_pids) * max_iter + 1
-            detail = (f"({1 + n_pids}) x {max_iter} iter + 1 final"
-                      f"  [gtol={step/10:.4f}, cache ile daha az olabilir]")
-
-        elif "Standalone" in algo_name:
-            total_run = max_iter + 1
-            detail = f"{max_iter} OC iter (1 run/iter) + 1 final  ← seri için en verimli"
-
-        elif "L-SHADE" in algo_name or "Adaptive" in algo_name:
-            ls_pop = max(n_parallel, min(50, max(15, n_pids // 4)))
-            ls_min = max(4, n_parallel)
-            total_run = ls_pop + ls_pop * max_iter + 1
-            detail = (f"Init: {ls_pop} + {max_iter} nesil x ~{ls_pop} birey + 1 final "
-                      f"[pop shrinks {ls_pop}→{ls_min}]")
-
-        elif "PSO" in algo_name or "Particle" in algo_name:
-            pso_pop = max(n_parallel, min(40, max(15, n_pids // 5)))
-            total_run = pso_pop + pso_pop * max_iter + 1
-            detail = (f"Init: {pso_pop} + {max_iter} nesil x {pso_pop} parçacık + 1 final")
-
-        elif "SPSA" in algo_name or "Stochastic Gradient" in algo_name:
-            total_run = 2 * max_iter + 1
-            detail = f"Her iter 2 çözüm (±Δ) x {max_iter} iter + 1 final — n'den bağımsız!"
-
-        elif "GA" in algo_name or "Genetic" in algo_name:
-            pop_size = max(10, 2 * n_pids)
-            total_run = pop_size * max_iter + 1
-            detail = f"{pop_size} pop x {max_iter} gen + 1 final"
-
-        elif "OC" in algo_name or "CMA" in algo_name:
-            oc_iters_est  = max(10, min(30, max_iter // 3))
-            cma_iters_est = max(1, max_iter - oc_iters_est)
-            cma_pop       = max(n_parallel, 4 + int(3 * np.log(max(n_pids, 2))))
-            rounds_per_gen = max(1, -(-cma_pop // max(n_parallel, 1)))
-            total_run = oc_iters_est + cma_iters_est * rounds_per_gen + 1
-            detail = (f"OC: {oc_iters_est} run + "
-                      f"CMA: {cma_iters_est} nesil x {rounds_per_gen} tur + 1 final")
-
-        else:
-            total_run = max_iter + 1
-            detail = "bilinmeyen algoritma"
-
-        self.total_run_var.set(str(total_run))
-        self._log(f"Total Run hesaplandı: {total_run}")
-        self._log(f"  Algoritma: {algo_name}")
-        self._log(f"  n_pids={n_pids}, max_iter={max_iter}, min_t={min_t}, max_t={max_t}, step={step}")
-        self._log(f"  Thickness aralığı: {n_steps} adım ({min_t} -> {max_t}, step={step})")
-        self._log(f"  Detay: {detail}")
-
     def _validate_common(self):
         bdf_path = self.bdf_entry.get().strip()
         nastran_exe = self.nastran_entry.get().strip()
@@ -3326,7 +3229,8 @@ class NastranToolApp:
                     os.path.join(output_dir, f"iteration_results_{_ts}.txt"),
                     "w", encoding="utf-8"
                 )
-                _iter_file.write("No\tEtiket\tKutle_kg\tMaxDisp\tMaxVonMises\tStress\n")
+                _iter_file.write(f"{'No':>6}  {'Etiket':<22}  {'Kutle_kg':>12}  {'MaxDisp':>12}  {'MaxVonMises':>12}  Stress\n")
+                _iter_file.write("-" * 80 + "\n")
                 _iter_file.flush()
             except Exception:
                 _iter_file = None
