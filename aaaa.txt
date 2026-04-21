@@ -2747,23 +2747,23 @@ class NastranToolApp:
         self.max_iter_entry.grid(row=1, column=5, padx=2, pady=(4, 0))
         self.max_iter_entry.insert(0, "500")
 
-        ttk.Label(param_frame, text="Paralel Run:").grid(row=1, column=6, sticky=tk.W, padx=2, pady=(4, 0))
-        self.n_parallel_entry = ttk.Entry(param_frame, width=8)
-        self.n_parallel_entry.grid(row=1, column=7, padx=2, pady=(4, 0))
-        self.n_parallel_entry.insert(0, "1")
-
         ttk.Label(param_frame, text="Memory (MB):").grid(row=2, column=0, sticky=tk.W, padx=2, pady=(4, 0))
         self.memory_entry = ttk.Entry(param_frame, width=8)
         self.memory_entry.grid(row=2, column=1, padx=2, pady=(4, 0))
         self.memory_entry.insert(0, "0")
         ttk.Label(param_frame, text="(0 = varsayılan)").grid(row=2, column=2, sticky=tk.W, padx=2, pady=(4, 0))
 
-        ttk.Label(param_frame, text="Total Run:").grid(row=2, column=3, sticky=tk.W, padx=2, pady=(4, 0))
+        ttk.Label(param_frame, text="Paralel Run:").grid(row=2, column=3, sticky=tk.W, padx=(8, 2), pady=(4, 0))
+        self.n_parallel_entry = ttk.Entry(param_frame, width=8)
+        self.n_parallel_entry.grid(row=2, column=4, padx=2, pady=(4, 0))
+        self.n_parallel_entry.insert(0, "1")
+
+        ttk.Label(param_frame, text="Total Run:").grid(row=2, column=5, sticky=tk.W, padx=2, pady=(4, 0))
         self.total_run_var = tk.StringVar(value="-")
         ttk.Label(param_frame, textvariable=self.total_run_var, width=8,
-                  relief="sunken", anchor=tk.CENTER).grid(row=2, column=4, padx=2, pady=(4, 0))
+                  relief="sunken", anchor=tk.CENTER).grid(row=2, column=6, padx=2, pady=(4, 0))
         ttk.Button(param_frame, text="Hesapla", width=8,
-                   command=self._calc_total_run).grid(row=2, column=5, padx=2, pady=(4, 0))
+                   command=self._calc_total_run).grid(row=2, column=7, padx=2, pady=(4, 0))
 
         ttk.Label(param_frame, text="Algoritma:").grid(row=3, column=0, sticky=tk.W, padx=2, pady=(4, 0))
         self.algo_var = tk.StringVar()
