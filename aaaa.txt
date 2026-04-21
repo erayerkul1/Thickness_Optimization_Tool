@@ -1870,8 +1870,8 @@ def optimize_lshade(bdf_path, nastran_exe, output_dir, pids, allowable_map,
 
     H      = 50
     p_frac = 0.11
-    N_init = max(n_parallel, min(50, max(15, n // 4)))
-    N_min  = max(4, n_parallel)
+    N_init = max(n_parallel, min(100, max(20, n // 4)))  # en az n_parallel, problem boyutuna gore
+    N_min  = max(4, n_parallel // 4)                     # LPSR: n_parallel'in ~%25'ine kadar kucul
 
     M_F  = np.full(H, 0.5)
     M_CR = np.full(H, 0.5)
