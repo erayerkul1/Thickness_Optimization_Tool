@@ -735,12 +735,13 @@ class IterationTracker:
     """Her iterasyonun mass, displacement, stress bilgisini tutar ve grafiğe çizer."""
 
     def __init__(self, pid_mid_map, mid_density_map, pid_area_map,
-                 max_disp_limit, plot_callback):
+                 max_disp_limit, plot_callback, iter_file=None):
         self.pid_mid_map = pid_mid_map
         self.mid_density_map = mid_density_map
         self.pid_area_map = pid_area_map
         self.max_disp_limit = max_disp_limit
         self.plot_callback = plot_callback
+        self.iter_file = iter_file
 
         self.iterations = []
         self.masses = []
@@ -767,6 +768,18 @@ class IterationTracker:
         self.stress_ok_list.append(stress_ok)
 
         log_mass_summary(total_mass, max_disp, self.max_disp_limit, max_vm, stress_ok, log_callback)
+
+        # İterasyon sonuçlarını dosyaya yaz
+        if self.iter_file is not None:
+            try:
+                self.iter_file.write(
+                    f"{len(self.iterations)}\t{iteration_label}\t"
+                    f"{total_mass:.6f}\t{max_disp:.6f}\t{max_vm:.2f}\t"
+                    f"{'OK' if stress_ok else 'FAIL'}\n"
+                )
+                self.iter_file.flush()
+            except Exception:
+                pass
 
         # Grafiği güncelle
         self.plot_callback(self.iterations, self.masses, self.displacements, self.max_disp_limit)
@@ -3008,6 +3021,12 @@ class NastranToolApp:
         self.root.after(0, _do_update)
 
     def _log(self, message):
+        if getattr(self, '_log_file', None) is not None:
+            try:
+                self._log_file.write(message + "\n")
+                self._log_file.flush()
+            except Exception:
+                pass
         def _append():
             self.log_text.configure(state=tk.NORMAL)
             self.log_text.insert(tk.END, message + "\n")
@@ -3284,9 +3303,34 @@ class NastranToolApp:
                     retain_mode="all", thickness_range_data=None,
                     stress_mode="Element Based", sigma_count=0, scratch_dir=None,
                     disp_direction="Mag", conv_patience=30, use_surrogate=False):
+        import datetime as _dt
+        _iter_file = None
+        self._log_file = None
         try:
             global _ref_op2_size
             _ref_op2_size = 0   # her optimizasyon başında kalibrasyonu sıfırla
+
+            # Log dosyası aç
+            _ts = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+            try:
+                self._log_file = open(
+                    os.path.join(output_dir, f"optimization_log_{_ts}.txt"),
+                    "w", encoding="utf-8"
+                )
+            except Exception:
+                self._log_file = None
+
+            # İterasyon sonuç dosyası aç
+            try:
+                _iter_file = open(
+                    os.path.join(output_dir, f"iteration_results_{_ts}.txt"),
+                    "w", encoding="utf-8"
+                )
+                _iter_file.write("No\tEtiket\tKutle_kg\tMaxDisp\tMaxVonMises\tStress\n")
+                _iter_file.flush()
+            except Exception:
+                _iter_file = None
+
             self._log("=" * 60)
             self._log(f"OPTİMİZASYON: {algo_name}")
             if thickness_range_data:
@@ -3346,7 +3390,8 @@ class NastranToolApp:
             # Tracker oluştur
             tracker = IterationTracker(
                 pid_mid_map, mid_density_map, pid_area_map,
-                max_disp_limit, self._update_plot
+                max_disp_limit, self._update_plot,
+                iter_file=_iter_file
             )
 
             # Algoritma çalıştır
@@ -3545,6 +3590,13 @@ class NastranToolApp:
             self._log(f"\nHATA: {error_msg}")
             self.root.after(0, lambda msg=error_msg: messagebox.showerror("Hata", msg))
         finally:
+            for _f in (_iter_file, self._log_file):
+                if _f is not None:
+                    try:
+                        _f.close()
+                    except Exception:
+                        pass
+            self._log_file = None
             if scratch_dir:
                 try:
                     cleanup_scratch_dir(scratch_dir, self._log)
