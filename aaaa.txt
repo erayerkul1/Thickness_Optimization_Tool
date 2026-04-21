@@ -396,11 +396,11 @@ def run_nastran(nastran_exe, bdf_path, output_dir, log_callback, memory_mb=0, sc
 
     if _ref_op2_size > 0:
         # Referans boyut biliniyorsa iki aşamalı bekleme:
-        #   Aşama 1 — dosya görünene kadar max 90s bekle; görünmezse Nastran çökmüş demektir
-        #   Aşama 2 — boyut >= %90 referans olana kadar max 300s toplam bekle
+        #   Aşama 1 — dosya görünene kadar max 180s bekle (paralel yük altında daha uzun sürebilir)
+        #   Aşama 2 — boyut >= %90 referans olana kadar max 600s toplam bekle
         _threshold  = int(_ref_op2_size * 0.90)
-        _appear_by  = _time.time() + 90
-        _full_by    = _time.time() + 300
+        _appear_by  = _time.time() + 180
+        _full_by    = _time.time() + 600
         _appeared   = False
         while _time.time() < _full_by:
             if os.path.isfile(op2_path):
@@ -408,11 +408,11 @@ def run_nastran(nastran_exe, bdf_path, output_dir, log_callback, memory_mb=0, sc
                 if os.path.getsize(op2_path) >= _threshold:
                     break
             elif not _appeared and _time.time() > _appear_by:
-                break   # 90s geçti, dosya hâlâ yok → Nastran başarısız
+                break   # 180s geçti, dosya hâlâ yok → Nastran başarısız
             _time.sleep(0.5)
     else:
         # Referans bilinmiyor — dosya görünene kadar bekle, sonra 5s flush buffer
-        _deadline = _time.time() + 120
+        _deadline = _time.time() + 180
         while _time.time() < _deadline:
             if os.path.isfile(op2_path) and os.path.getsize(op2_path) > 0:
                 _time.sleep(5.0)
@@ -773,8 +773,8 @@ class IterationTracker:
         if self.iter_file is not None:
             try:
                 self.iter_file.write(
-                    f"{len(self.iterations)}\t{iteration_label}\t"
-                    f"{total_mass:.6f}\t{max_disp:.6f}\t{max_vm:.2f}\t"
+                    f"{len(self.iterations):>6}  {iteration_label:<22}  "
+                    f"{total_mass:>12.6f}  {max_disp:>12.6f}  {max_vm:>12.2f}  "
                     f"{'OK' if stress_ok else 'FAIL'}\n"
                 )
                 self.iter_file.flush()
@@ -3326,7 +3326,8 @@ class NastranToolApp:
                     os.path.join(output_dir, f"iteration_results_{_ts}.txt"),
                     "w", encoding="utf-8"
                 )
-                _iter_file.write("No\tEtiket\tKutle_kg\tMaxDisp\tMaxVonMises\tStress\n")
+                _iter_file.write(f"{'No':>6}  {'Etiket':<22}  {'Kutle_kg':>12}  {'MaxDisp':>12}  {'MaxVonMises':>12}  Stress\n")
+                _iter_file.write("-" * 80 + "\n")
                 _iter_file.flush()
             except Exception:
                 _iter_file = None
