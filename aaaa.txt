@@ -735,12 +735,13 @@ class IterationTracker:
     """Her iterasyonun mass, displacement, stress bilgisini tutar ve grafiğe çizer."""
 
     def __init__(self, pid_mid_map, mid_density_map, pid_area_map,
-                 max_disp_limit, plot_callback):
+                 max_disp_limit, plot_callback, iter_file=None):
         self.pid_mid_map = pid_mid_map
         self.mid_density_map = mid_density_map
         self.pid_area_map = pid_area_map
         self.max_disp_limit = max_disp_limit
         self.plot_callback = plot_callback
+        self.iter_file = iter_file
 
         self.iterations = []
         self.masses = []
@@ -767,6 +768,18 @@ class IterationTracker:
         self.stress_ok_list.append(stress_ok)
 
         log_mass_summary(total_mass, max_disp, self.max_disp_limit, max_vm, stress_ok, log_callback)
+
+        # İterasyon sonuçlarını dosyaya yaz
+        if self.iter_file is not None:
+            try:
+                self.iter_file.write(
+                    f"{len(self.iterations)}\t{iteration_label}\t"
+                    f"{total_mass:.6f}\t{max_disp:.6f}\t{max_vm:.2f}\t"
+                    f"{'OK' if stress_ok else 'FAIL'}\n"
+                )
+                self.iter_file.flush()
+            except Exception:
+                pass
 
         # Grafiği güncelle
         self.plot_callback(self.iterations, self.masses, self.displacements, self.max_disp_limit)
@@ -2650,10 +2663,7 @@ class NastranToolApp:
         ttk.Label(main_frame, text="BDF Dosyası:").grid(row=row, column=0, sticky=tk.W, pady=2)
         self.bdf_entry = ttk.Entry(main_frame, width=45)
         self.bdf_entry.grid(row=row, column=1, columnspan=2, sticky=tk.EW, padx=4)
-        ttk.Button(main_frame, text="Seç...", command=lambda: select_file(
-            self.bdf_entry, "BDF Dosyası Seçiniz",
-            [("BDF Dosyaları", "*.bdf *.dat *.nas"), ("Tüm Dosyalar", "*.*")]
-        )).grid(row=row, column=3)
+        ttk.Button(main_frame, text="Seç...", command=self._browse_bdf).grid(row=row, column=3)
 
         row += 1
         ttk.Label(main_frame, text="NX Nastran:").grid(row=row, column=0, sticky=tk.W, pady=2)
@@ -2886,25 +2896,57 @@ class NastranToolApp:
             self.n_parallel_entry.insert(0, "1")
         else:
             self.n_parallel_entry.configure(state=tk.NORMAL)
+        self._update_iter_hints()
 
-        # Algoritma bazlı önerilen max_iter ve patience değerleri
-        _defaults = {
-            "OC + sep-CMA-ES": (500,  50),
-            "OC Standalone":   (150,  20),
-            "L-SHADE":         (300,  40),
-            "PSO":             (300,  40),
-            "SPSA":            (500,  50),
-            "Genetic":         (100,  20),
-            "FD + SQP":        (50,   10),
+    def _browse_bdf(self):
+        path = filedialog.askopenfilename(
+            title="BDF Dosyası Seçiniz",
+            filetypes=[("BDF Dosyaları", "*.bdf *.dat *.nas"), ("Tüm Dosyalar", "*.*")]
+        )
+        if not path:
+            return
+        self.bdf_entry.delete(0, tk.END)
+        self.bdf_entry.insert(0, path)
+        # PSHELL sayısını hızlıca say (tam parse gerekmez)
+        n = 0
+        try:
+            with open(path, "r", errors="ignore") as _f:
+                for _line in _f:
+                    if _line[:6].strip().upper() == "PSHELL":
+                        n += 1
+        except Exception:
+            pass
+        self._n_pshell = n
+        self._update_iter_hints()
+
+    def _update_iter_hints(self):
+        """Seçili algoritma ve PSHELL sayısına göre önerilen iter/patience hesaplar."""
+        algo = self.algo_var.get()
+        n = getattr(self, "_n_pshell", 0)
+
+        # (base, k, cap) — rec_iter = min(base + k*n, cap)
+        _params = {
+            "OC + sep-CMA-ES": (200, 1.0,  1000),
+            "OC Standalone":   ( 80, 0.5,   300),
+            "L-SHADE":         (150, 1.0,   600),
+            "PSO":             (150, 1.0,   600),
+            "SPSA":            (300, 2.0,  1500),
+            "Genetic":         ( 50, 0.5,   300),
+            "FD + SQP":        ( 20, 0.2,   100),
         }
-        rec_iter, rec_pat = 500, 50
-        for key, vals in _defaults.items():
+        base, k, cap = 200, 1.0, 1000
+        for key, vals in _params.items():
             if key in algo:
-                rec_iter, rec_pat = vals
+                base, k, cap = vals
                 break
+
+        rec_iter = int(min(base + k * max(n, 0), cap))
+        rec_pat  = max(10, rec_iter // 10)
+
         self.max_iter_entry.delete(0, tk.END)
         self.max_iter_entry.insert(0, str(rec_iter))
-        self.max_iter_label_var.set(f"Max Iter (Önerilen: {rec_iter}):")
+        hint_n = f", n={n}" if n > 0 else ""
+        self.max_iter_label_var.set(f"Max Iter (Önerilen: {rec_iter}{hint_n}):")
         self.conv_patience_entry.delete(0, tk.END)
         self.conv_patience_entry.insert(0, str(rec_pat))
         self.patience_hint_var.set(f"(Önerilen: {rec_pat})")
@@ -2979,6 +3021,12 @@ class NastranToolApp:
         self.root.after(0, _do_update)
 
     def _log(self, message):
+        if getattr(self, '_log_file', None) is not None:
+            try:
+                self._log_file.write(message + "\n")
+                self._log_file.flush()
+            except Exception:
+                pass
         def _append():
             self.log_text.configure(state=tk.NORMAL)
             self.log_text.insert(tk.END, message + "\n")
@@ -3255,9 +3303,34 @@ class NastranToolApp:
                     retain_mode="all", thickness_range_data=None,
                     stress_mode="Element Based", sigma_count=0, scratch_dir=None,
                     disp_direction="Mag", conv_patience=30, use_surrogate=False):
+        import datetime as _dt
+        _iter_file = None
+        self._log_file = None
         try:
             global _ref_op2_size
             _ref_op2_size = 0   # her optimizasyon başında kalibrasyonu sıfırla
+
+            # Log dosyası aç
+            _ts = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+            try:
+                self._log_file = open(
+                    os.path.join(output_dir, f"optimization_log_{_ts}.txt"),
+                    "w", encoding="utf-8"
+                )
+            except Exception:
+                self._log_file = None
+
+            # İterasyon sonuç dosyası aç
+            try:
+                _iter_file = open(
+                    os.path.join(output_dir, f"iteration_results_{_ts}.txt"),
+                    "w", encoding="utf-8"
+                )
+                _iter_file.write("No\tEtiket\tKutle_kg\tMaxDisp\tMaxVonMises\tStress\n")
+                _iter_file.flush()
+            except Exception:
+                _iter_file = None
+
             self._log("=" * 60)
             self._log(f"OPTİMİZASYON: {algo_name}")
             if thickness_range_data:
@@ -3317,7 +3390,8 @@ class NastranToolApp:
             # Tracker oluştur
             tracker = IterationTracker(
                 pid_mid_map, mid_density_map, pid_area_map,
-                max_disp_limit, self._update_plot
+                max_disp_limit, self._update_plot,
+                iter_file=_iter_file
             )
 
             # Algoritma çalıştır
@@ -3516,6 +3590,13 @@ class NastranToolApp:
             self._log(f"\nHATA: {error_msg}")
             self.root.after(0, lambda msg=error_msg: messagebox.showerror("Hata", msg))
         finally:
+            for _f in (_iter_file, self._log_file):
+                if _f is not None:
+                    try:
+                        _f.close()
+                    except Exception:
+                        pass
+            self._log_file = None
             if scratch_dir:
                 try:
                     cleanup_scratch_dir(scratch_dir, self._log)
