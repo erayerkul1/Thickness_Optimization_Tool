@@ -389,6 +389,9 @@ def run_nastran(nastran_exe, bdf_path, output_dir, log_callback, memory_mb=0, sc
 
     if result.returncode != 0:
         log_callback(f"  Nastran return code: {result.returncode}")
+        _stderr = (result.stderr or "").strip()
+        if _stderr:
+            log_callback(f"  Nastran stderr: {_stderr[-400:]}")
 
     # OP2 dosyasının tam yazılmasını bekle
     import time as _time
@@ -420,6 +423,28 @@ def run_nastran(nastran_exe, bdf_path, output_dir, log_callback, memory_mb=0, sc
             _time.sleep(0.5)
 
     if not os.path.isfile(op2_path):
+        f06_path = os.path.join(output_dir, bdf_basename + ".f06")
+        if os.path.isfile(f06_path):
+            try:
+                _all_fatal = []
+                with open(f06_path, "r", errors="ignore") as _f:
+                    _content = _f.read()
+                for _line in _content.splitlines():
+                    _lu = _line.strip().upper()
+                    if any(k in _lu for k in ("FATAL", "LICENSE", "FLEXLM", "CHECKOUT")):
+                        _all_fatal.append(_line.strip()[:250])
+                if _all_fatal:
+                    _joined = " ".join(_all_fatal).upper()
+                    if any(k in _joined for k in ("ALL", "IN USE", "EXHAUSTED", "LIMIT", "MAXIMUM")):
+                        _reason = "[Lisans Doldu]"
+                    elif any(k in _joined for k in ("CANNOT", "UNABLE", "NOT FOUND", "NO LICENSE",
+                                                     "FAILED", "CONNECT", "SERVER", "HOST")):
+                        _reason = "[Lisans Bulunamadı]"
+                    else:
+                        _reason = "[F06 Hatası]"
+                    log_callback(f"  {_reason} " + " | ".join(_all_fatal[-4:]))
+            except Exception:
+                pass
         raise FileNotFoundError(
             f"OP2 bulunamadı: {op2_path}\n"
             "BDF'de 'PARAM,POST,-1' olduğundan emin olunuz."
