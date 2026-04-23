@@ -2063,7 +2063,7 @@ def optimize_lshade(bdf_path, nastran_exe, output_dir, pids, allowable_map,
                 nastran_indices = list(np.argsort(pred_fit)[:n_validate])
                 for i in range(pop_now):
                     if i not in nastran_indices:
-                        surrogate_results[i] = (trial_t_maps[i], float(pred_d[i]), {})
+                        surrogate_results[i] = (trial_t_maps[i], max(0.0, float(pred_d[i])), {})
 
         if n_parallel > 1:
             batch = [(trial_t_maps[i], os.path.join(output_dir, f"lshade_g{gen+1}_i{i}"))
@@ -2114,8 +2114,9 @@ def optimize_lshade(bdf_path, nastran_exe, output_dir, pids, allowable_map,
                     stress_map, allowable_map, stress_mode, sigma_count,
                     eid_pid_map, eid_area_map)
                 trial_fit = _fitness(trial_t_maps[i], max_disp, stress_ok)
-                tracker.record(f"LS_G{gen+1}_{i+1}", trial_t_maps[i], max_disp, max_vm,
-                               stress_ok, allowable_map, log_callback)
+                if i in nastran_map:  # sadece gerçek Nastran sonuçlarını kaydet
+                    tracker.record(f"LS_G{gen+1}_{i+1}", trial_t_maps[i], max_disp, max_vm,
+                                   stress_ok, allowable_map, log_callback)
 
                 if trial_fit <= fitness[i]:
                     archive.append(population[i].copy())
