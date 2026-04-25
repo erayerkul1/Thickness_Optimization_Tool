@@ -2470,7 +2470,7 @@ def optimize_spsa(bdf_path, nastran_exe, output_dir, pids, allowable_map,
     alpha  = 0.602
     gamma  = 0.101
     A      = max_iter * 0.1
-    a_coef = mean_range * 0.2 * (1.0 + A) ** alpha
+    a_coef = float(np.mean(pid_step_arr)) * (1.0 + A) ** alpha
     c_coef = max(float(np.mean(pid_step_arr)), 1e-6)
 
     log_callback(f"\n  SPSA — {n} PSHELL, her iter 2 çözüm, max_iter={max_iter}")
@@ -2547,7 +2547,7 @@ def optimize_spsa(bdf_path, nastran_exe, output_dir, pids, allowable_map,
         if len(f_vals) == 2:
             f_plus, f_minus = f_vals
             g_hat = (f_plus - f_minus) / (2.0 * max(c_k, 1e-10) * delta)
-            x = np.clip(x - a_k * g_hat, pid_min_arr, pid_max_arr)
+            x = np.clip(x - a_k * np.sign(g_hat), pid_min_arr, pid_max_arr)
 
         log_callback(f"  SPSA k={k+1}/{max_iter}: a_k={a_k:.5f}, c_k={c_k:.5f}, "
                      f"best_fit={best_fit:.4f}")
