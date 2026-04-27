@@ -1,0 +1,3544 @@
+"""
+Eray-Tool: NX Nastran Thickness Optimization Tool
+
+BDF dosyasındaki PSHELL'lerin kalınlıklarını bağımsız olarak optimize eder.
+Amaç: Minimum ağırlık ile displacement ve stress sınırlarını sağlamak.
+
+Algoritmalar:
+  1) FD + SQP (Forward Difference)
+  2) Genetic Algorithm (GA)
+"""
+
+import os
+import glob as globmod
+import subprocess
+import logging as _logging
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use("TkAgg")
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from pyNastran.op2.op2 import OP2
+from pyNastran.bdf.bdf import BDF
+
+# İlk başarılı OP2 dosyasından kalibrasyon yapılır; sonraki bekleme kararları buna göre verilir.
+_ref_op2_size: int = 0
+_ref_op2_lock = threading.Lock()
+
+
+class _NullWriter:
+    """pyNastran binary_debug için no-op writer."""
+    def write(self, *a, **kw): pass
+    def flush(self): pass
+    def close(self): pass
+    def __getattr__(self, name):
+        return lambda *a, **kw: None
+
+
+# PyInstaller --windowed exe'lerde sys.stdout/stderr None olur;
+# cpylog (pyNastran logger) stdout'a yazmaya çalışınca AttributeError alırız.
+import sys as _sys
+if _sys.stdout is None:
+    _sys.stdout = _NullWriter()
+if _sys.stderr is None:
+    _sys.stderr = _NullWriter()
+
+
+def _patch_cpylog():
+    """cpylog.screen_utils.write_screen'i güvenli hale getirir.
+
+    cpylog import sırasında sys.stdout referansını kaydeder (_STDOUT = sys.stdout).
+    Eğer o anda stdout None ise (windowed exe veya thread başlatma sırasında),
+    sonraki tüm write_screen çağrıları AttributeError verir.
+    Surrogate etkin olduğunda sklearn import'u farklı bir iş parçacığında
+    cpylog'u bu hatalı durumda tetikleyebilir.
+    """
+    try:
+        import cpylog.screen_utils as _csu
+        _orig_ws = _csu.write_screen
+        def _safe_write_screen(*a, **kw):
+            try:
+                _orig_ws(*a, **kw)
+            except (AttributeError, TypeError, OSError):
+                pass
+        _csu.write_screen = _safe_write_screen
+    except Exception:
+        pass
+    # stdout_logging fonksiyonunu da güvenceye al (cpylog iç fonksiyonu)
+    try:
+        import cpylog as _cpylog
+        for _attr in ('stdout_logging', 'write_screen'):
+            _fn = getattr(_cpylog, _attr, None)
+            if _fn is None:
+                continue
+            def _safe_fn(*a, _f=_fn, **kw):
+                try:
+                    return _f(*a, **kw)
+                except (AttributeError, TypeError, OSError):
+                    pass
+            setattr(_cpylog, _attr, _safe_fn)
+    except Exception:
+        pass
+
+_patch_cpylog()  # modül yüklenince bir kez çalışır
+
+_pynastran_patched_ids: set = set()   # bir kez patch edilen sınıflar
+
+
+def _patch_pynastran_binary_debug():
+    """O ana kadar yüklenmiş tüm pyNastran sınıflarına binary_debug=None guard ekler.
+
+    _SafeOP2 yalnızca ana OP2 nesnesini korur. pyNastran read_op2() içinde
+    oluşturduğu iç okuyucu nesneleri (Op2Reader vb.) bağımsız olarak
+    self.binary_debug = None yapabilir. Bu fonksiyon sys.modules üzerinden
+    tüm pyNastran sınıflarını tarar ve __setattr__ override ile None atamasını
+    _NullWriter() ile değiştirir. Her sınıf yalnızca bir kez patch edilir.
+    """
+    import sys
+    global _pynastran_patched_ids
+    for _mod in list(sys.modules.values()):
+        _mname = getattr(_mod, '__name__', '') or ''
+        if not _mname.startswith('pyNastran'):
+            continue
+        for _cls in list(vars(_mod).values()):
+            if not isinstance(_cls, type):
+                continue
+            if id(_cls) in _pynastran_patched_ids:
+                continue
+            _pynastran_patched_ids.add(id(_cls))
+            if '__setattr__' in vars(_cls):
+                continue   # zaten özel __setattr__ var, dokunma
+            try:
+                _orig_sa = _cls.__setattr__
+                def _mk(_o=_orig_sa):
+                    def _sa(self, _n, _v):
+                        if _n == 'binary_debug' and _v is None:
+                            _v = _NullWriter()
+                        _o(self, _n, _v)
+                    return _sa
+                _cls.__setattr__ = _mk()
+            except TypeError:
+                pass
+
+
+class _SafeOP2(OP2):
+    """binary_debug setter/deleter'ı None/silme işlemini engeller.
+
+    pyNastran read_op2() içinde hem self.binary_debug = None hem de
+    del self.binary_debug yapabiliyor. İkisi de .write() hatasına yol
+    açar. Bu alt sınıf her ikisini de _NullWriter()'a yönlendirir.
+    """
+    @property
+    def binary_debug(self):
+        return self.__dict__.get('_binary_debug', _NullWriter())
+
+    @binary_debug.setter
+    def binary_debug(self, value):
+        self.__dict__['_binary_debug'] = _NullWriter() if value is None else value
+
+    @binary_debug.deleter
+    def binary_debug(self):
+        self.__dict__['_binary_debug'] = _NullWriter()
+
+
+def _make_op2():
+    import tempfile as _tf
+    _dbg = _tf.mktemp(suffix='.op2_dbg')   # pyNastran bu dosyayı açar → binary_debug asla None olmaz
+    m = _SafeOP2(debug=False, debug_file=_dbg, mode='nx')
+    m._dbg_path = _dbg
+    if m.log is None:
+        _l = _logging.getLogger('pynastran_null')
+        if not _l.handlers:
+            _l.addHandler(_logging.NullHandler())
+        m.log = _l
+    return m
+
+
+def _read_op2_with_retry(op2_path, log_callback, max_attempts=3, wait_sec=1.0):
+    """OP2 okumayı birkaç kez dener; her denemede yeni _SafeOP2 nesnesi kullanır."""
+    import time as _time
+    import traceback as _tb_mod
+    last_exc = None
+    for attempt in range(1, max_attempts + 1):
+        _patch_cpylog()                    # cpylog lazy-import sonrası da güvenli olsun
+        _patch_pynastran_binary_debug()   # lazy-import edilen sınıflar da yakalanır
+        m = _make_op2()
+        try:
+            m.read_op2(op2_path)
+            return m
+        except Exception as _exc:
+            last_exc = _exc
+            _full_tb = _tb_mod.format_exc()
+            if attempt < max_attempts:
+                log_callback(
+                    f"  OP2 okuma denemesi {attempt}/{max_attempts} başarısız "
+                    f"({_exc}), {wait_sec:.0f}s bekleniyor...\n{_full_tb}"
+                )
+                _time.sleep(wait_sec)
+            else:
+                log_callback(
+                    f"  OP2 okuma denemesi {attempt}/{max_attempts} başarısız "
+                    f"({_exc})\n{_full_tb}"
+                )
+        finally:
+            _dbg = getattr(m, '_dbg_path', None)
+            if _dbg:
+                try:
+                    os.remove(_dbg)
+                except OSError:
+                    pass
+    raise RuntimeError(
+        f"OP2 okunamadı — {max_attempts} deneme sonuç vermedi. Son hata: {last_exc}"
+    ) from last_exc
+
+
+# ---------------------------------------------------------------------------
+# Yardımcı fonksiyonlar
+# ---------------------------------------------------------------------------
+
+def select_file(entry, title, filetypes):
+    path = filedialog.askopenfilename(title=title, filetypes=filetypes)
+    if path:
+        entry.delete(0, tk.END)
+        entry.insert(0, path)
+
+
+def select_directory(entry, title):
+    path = filedialog.askdirectory(title=title)
+    if path:
+        entry.delete(0, tk.END)
+        entry.insert(0, path)
+
+
+def format_nastran_real(value):
+    """Nastran real format: integer değerlerde bile ondalık nokta olmalı (2 -> 2.0)"""
+    s = f"{value:g}"
+    if "." not in s and "e" not in s.lower():
+        s += ".0"
+    return s
+
+
+# ---------------------------------------------------------------------------
+# BDF okuma: PSHELL, malzeme density, eleman alanları
+# ---------------------------------------------------------------------------
+
+def read_bdf_model(bdf_path):
+    """pyNastran ile BDF'yi okur ve PSHELL bilgilerini çıkarır.
+    Returns:
+        pids: PSHELL PID listesi
+        pid_mid_map: {pid: mid} PSHELL -> malzeme eşlemesi
+        mid_density_map: {mid: rho} malzeme density
+        pid_area_map: {pid: total_area} her PSHELL'e ait elemanların toplam alanı
+        eid_pid_map: {eid: pid} eleman -> property eşlemesi
+        eid_area_map: {eid: area} eleman alanları
+    """
+    model = BDF(debug=False)
+    model.read_bdf(bdf_path, xref=True)
+
+    pids = []
+    pid_mid_map = {}
+    mid_density_map = {}
+    pid_area_map = {}
+    eid_pid_map = {}
+    eid_area_map = {}
+
+    # PSHELL kartlarını oku
+    for pid, prop in model.properties.items():
+        if prop.type == "PSHELL":
+            pids.append(pid)
+            mid = prop.mid1_ref.mid if hasattr(prop, "mid1_ref") and prop.mid1_ref else prop.Mid1()
+            pid_mid_map[pid] = mid
+
+    # MAT1 density ve Young's modülüsü değerlerini oku
+    mid_E_map = {}
+    for mid, mat in model.materials.items():
+        if hasattr(mat, "rho"):
+            mid_density_map[mid] = mat.rho
+        if hasattr(mat, "e") and mat.e is not None:
+            mid_E_map[mid] = float(mat.e)
+
+    # Her PID'e ait elemanların toplam alanını hesapla
+    for pid in pids:
+        pid_area_map[pid] = 0.0
+
+    for eid, elem in model.elements.items():
+        if elem.type in ("CQUAD4", "CTRIA3", "CQUAD8", "CTRIA6"):
+            elem_pid = elem.pid
+            eid_pid_map[eid] = elem_pid
+            if elem_pid in pid_area_map:
+                try:
+                    area = elem.Area()
+                    pid_area_map[elem_pid] += area
+                    eid_area_map[eid] = area
+                except Exception:
+                    pass
+
+    return pids, pid_mid_map, mid_density_map, mid_E_map, pid_area_map, eid_pid_map, eid_area_map
+
+
+def compute_real_mass(thickness_map, pid_mid_map, mid_density_map, pid_area_map):
+    """Gerçek kütle hesabı: mass = sum(thickness * area * density) for each PID"""
+    total_mass = 0.0
+    pid_mass = {}
+    for pid, t in thickness_map.items():
+        area = pid_area_map.get(pid, 0.0)
+        mid = pid_mid_map.get(pid)
+        rho = mid_density_map.get(mid, 0.0) if mid else 0.0
+        m = t * area * rho
+        pid_mass[pid] = m
+        total_mass += m
+    return total_mass, pid_mass
+
+
+# ---------------------------------------------------------------------------
+# BDF PSHELL yazma (pyNastran kullanmadan, hızlı text işlemi)
+# ---------------------------------------------------------------------------
+
+def read_pshell_pids(bdf_path):
+    """BDF dosyasından PSHELL PID listesini okur (hızlı text tarama)."""
+    pids = []
+    with open(bdf_path, "r") as f:
+        for line in f:
+            if line.upper().startswith("PSHELL"):
+                if "," in line:
+                    parts = line.split(",")
+                    pids.append(int(parts[1].strip()))
+                else:
+                    pid_field = line[8:16].strip()
+                    if pid_field:
+                        pids.append(int(pid_field))
+    return pids
+
+
+def modify_pshell_thicknesses(bdf_path, output_bdf_path, thickness_map, log_callback=None):
+    """BDF dosyasındaki PSHELL kalınlıklarını thickness_map'e göre değiştirir."""
+    with open(bdf_path, "r") as f:
+        lines = f.readlines()
+
+    modified_count = 0
+    new_lines = []
+
+    for line in lines:
+        if line.upper().startswith("PSHELL") and "," in line:
+            parts = line.split(",")
+            if len(parts) >= 4:
+                pid = int(parts[1].strip())
+                if pid in thickness_map:
+                    parts[3] = format_nastran_real(thickness_map[pid])
+                    new_lines.append(",".join(parts))
+                    modified_count += 1
+                else:
+                    new_lines.append(line)
+            else:
+                new_lines.append(line)
+        elif line.upper().startswith("PSHELL"):
+            if len(line) >= 32:
+                pid_field = line[8:16].strip()
+                if pid_field:
+                    pid = int(pid_field)
+                    if pid in thickness_map:
+                        t_field = format_nastran_real(thickness_map[pid]).rjust(8)
+                        new_line = line[:24] + t_field + line[32:]
+                        new_lines.append(new_line)
+                        modified_count += 1
+                    else:
+                        new_lines.append(line)
+                else:
+                    new_lines.append(line)
+            else:
+                new_lines.append(line)
+        else:
+            new_lines.append(line)
+
+    with open(output_bdf_path, "w") as f:
+        f.writelines(new_lines)
+
+    if log_callback:
+        log_callback(f"  {modified_count} PSHELL güncellendi.")
+    return modified_count
+
+
+# ---------------------------------------------------------------------------
+# Nastran çalıştırma
+# ---------------------------------------------------------------------------
+
+def run_nastran(nastran_exe, bdf_path, output_dir, log_callback, memory_mb=0, scratch_dir=None):
+    bdf_basename = os.path.splitext(os.path.basename(bdf_path))[0]
+    op2_path = os.path.join(output_dir, bdf_basename + ".op2")
+
+    cmd = [nastran_exe, bdf_path, f"out={output_dir}{os.sep}{bdf_basename}"]
+    if memory_mb > 0:
+        cmd.append(f"mem={memory_mb}mb")
+    if scratch_dir:
+        # Her run icin run klasoru adiyla ayni scratch alt klasoru olustur
+        run_scratch = os.path.join(scratch_dir, os.path.basename(output_dir))
+        os.makedirs(run_scratch, exist_ok=True)
+        cmd.append("scr=yes")
+        cmd.append(f"sdir={run_scratch}")
+        log_callback(f"  Nastran: {bdf_basename}" + (f" (mem={memory_mb}mb)" if memory_mb > 0 else "") + f" (scratch={run_scratch})")
+    else:
+        log_callback(f"  Nastran: {bdf_basename}" + (f" (mem={memory_mb}mb)" if memory_mb > 0 else ""))
+
+    result = subprocess.run(cmd, capture_output=True, text=True, cwd=output_dir)
+
+    if result.returncode != 0:
+        log_callback(f"  Nastran return code: {result.returncode}")
+        _stderr = (result.stderr or "").strip()
+        if _stderr:
+            log_callback(f"  Nastran stderr: {_stderr[-400:]}")
+
+    # OP2 dosyasının tam yazılmasını bekle
+    import time as _time
+    global _ref_op2_size
+
+    if _ref_op2_size > 0:
+        # Referans boyut biliniyorsa iki aşamalı bekleme:
+        #   Aşama 1 — dosya görünene kadar max 180s bekle (paralel yük altında daha uzun sürebilir)
+        #   Aşama 2 — boyut >= %90 referans olana kadar max 600s toplam bekle
+        _threshold  = int(_ref_op2_size * 0.90)
+        _appear_by  = _time.time() + 180
+        _full_by    = _time.time() + 600
+        _appeared   = False
+        while _time.time() < _full_by:
+            if os.path.isfile(op2_path):
+                _appeared = True
+                if os.path.getsize(op2_path) >= _threshold:
+                    break
+            elif not _appeared and _time.time() > _appear_by:
+                break   # 180s geçti, dosya hâlâ yok → Nastran başarısız
+            _time.sleep(0.5)
+    else:
+        # Referans bilinmiyor — dosya görünene kadar bekle, sonra 5s flush buffer
+        _deadline = _time.time() + 180
+        while _time.time() < _deadline:
+            if os.path.isfile(op2_path) and os.path.getsize(op2_path) > 0:
+                _time.sleep(5.0)
+                break
+            _time.sleep(0.5)
+
+    if not os.path.isfile(op2_path):
+        f06_path = os.path.join(output_dir, bdf_basename + ".f06")
+        if os.path.isfile(f06_path):
+            try:
+                _all_fatal = []
+                with open(f06_path, "r", errors="ignore") as _f:
+                    _content = _f.read()
+                for _line in _content.splitlines():
+                    _lu = _line.strip().upper()
+                    if any(k in _lu for k in ("FATAL", "LICENSE", "FLEXLM", "CHECKOUT")):
+                        _all_fatal.append(_line.strip()[:250])
+                if _all_fatal:
+                    _joined = " ".join(_all_fatal).upper()
+                    if any(k in _joined for k in ("ALL", "IN USE", "EXHAUSTED", "LIMIT", "MAXIMUM")):
+                        _reason = "[Lisans Doldu]"
+                    elif any(k in _joined for k in ("CANNOT", "UNABLE", "NOT FOUND", "NO LICENSE",
+                                                     "FAILED", "CONNECT", "SERVER", "HOST")):
+                        _reason = "[Lisans Bulunamadı]"
+                    else:
+                        _reason = "[F06 Hatası]"
+                    log_callback(f"  {_reason} " + " | ".join(_all_fatal[-4:]))
+            except Exception:
+                pass
+        raise FileNotFoundError(
+            f"OP2 bulunamadı: {op2_path}\n"
+            "BDF'de 'PARAM,POST,-1' olduğundan emin olunuz."
+        )
+    return op2_path
+
+
+# ---------------------------------------------------------------------------
+# OP2 sonuç okuma
+# ---------------------------------------------------------------------------
+
+def get_von_mises_stresses(op2_model):
+    stress_map = {}
+    for attr_name in ("cquad4_stress", "ctria3_stress"):
+        stress_dict = getattr(op2_model, attr_name, None)
+        if not stress_dict:
+            continue
+        for subcase_id, stress_obj in stress_dict.items():
+            if hasattr(stress_obj, "element_node"):
+                eids = stress_obj.element_node[:, 0]
+                center_mask = stress_obj.element_node[:, 1] == 0
+            elif hasattr(stress_obj, "element"):
+                eids = stress_obj.element
+                center_mask = None
+            else:
+                continue
+            ovm = stress_obj.data
+            for t_idx in range(ovm.shape[0]):
+                for i in range(ovm.shape[1]):
+                    if center_mask is not None and not center_mask[i]:
+                        continue
+                    eid = int(eids[i])
+                    vm_val = float(ovm[t_idx, i, -1])
+                    if eid not in stress_map or vm_val > stress_map[eid]:
+                        stress_map[eid] = vm_val
+    return stress_map
+
+
+def get_max_absolute_displacement(op2_model, direction="Mag"):
+    """OP2 modelinden maksimum displacement değerini okur.
+    direction: 'Mag' (büyüklük), 'X' (T1), 'Y' (T2), 'Z' (T3)
+    """
+    _dir_idx = {"X": 0, "Y": 1, "Z": 2}
+    max_disp = 0.0
+    if not op2_model.displacements:
+        return 0.0
+
+    for subcase_id, disp_obj in op2_model.displacements.items():
+        if direction == "Mag":
+            translations = disp_obj.data[:, :, :3]
+            values = np.sqrt(np.sum(translations ** 2, axis=2))
+        else:
+            idx = _dir_idx[direction]
+            values = np.abs(disp_obj.data[:, :, idx])
+
+        current_max = float(np.max(values))
+        if current_max > max_disp:
+            max_disp = current_max
+    return max_disp
+
+
+def extract_results_csv(op2_model, output_dir, label, log_callback):
+    stress_map = get_von_mises_stresses(op2_model)
+    if stress_map:
+        rows = [{"ElementID": eid, "VonMises": vm} for eid, vm in sorted(stress_map.items())]
+        df = pd.DataFrame(rows)
+        csv_path = os.path.join(output_dir, f"von_mises_{label}.csv")
+        df.to_csv(csv_path, index=False)
+        log_callback(f"  Stress CSV: {csv_path} ({len(df)} eleman)")
+
+    if op2_model.displacements:
+        disp_data = []
+        for subcase_id, disp_obj in op2_model.displacements.items():
+            node_ids = disp_obj.node_gridtype[:, 0]
+            data = disp_obj.data
+            for t_idx in range(data.shape[0]):
+                for i, nid in enumerate(node_ids):
+                    r = data[t_idx, i, :]
+                    disp_data.append({
+                        "NodeID": int(nid),
+                        "T1": r[0], "T2": r[1], "T3": r[2],
+                        "R1": r[3], "R2": r[4], "R3": r[5],
+                        "Magnitude": float(np.sqrt(r[0]**2 + r[1]**2 + r[2]**2)),
+                    })
+        df = pd.DataFrame(disp_data)
+        csv_path = os.path.join(output_dir, f"displacements_{label}.csv")
+        df.to_csv(csv_path, index=False)
+        log_callback(f"  Disp CSV: {csv_path} ({len(df)} satır)")
+
+
+def load_allowable_excel(excel_path, sheet_name="Stress Allowable(Element Based)"):
+    df = pd.read_excel(excel_path, sheet_name=sheet_name)
+    df.columns = [c.strip() for c in df.columns]
+    id_col = df.columns[0]
+    allow_col = df.columns[1]
+    return {int(row[id_col]): float(row[allow_col]) for _, row in df.iterrows()}
+
+
+def load_thickness_range_excel(excel_path):
+    """Thickness Range sayfasından PID bazlı tmin, tmax, step okur.
+    Returns: {pid: (tmin, tmax, step)}
+    """
+    df = pd.read_excel(excel_path, sheet_name="Thickness Range")
+    df.columns = [c.strip() for c in df.columns]
+    result = {}
+    for _, row in df.iterrows():
+        pid = int(row[df.columns[0]])
+        tmin = float(row[df.columns[1]])
+        tmax = float(row[df.columns[2]])
+        step = float(row[df.columns[3]])
+        result[pid] = (tmin, tmax, step)
+    return result
+
+
+
+def check_stress_constraints(stress_map, allowable_map):
+    failed = []
+    max_vm = 0.0
+    for eid, vm in stress_map.items():
+        if vm > max_vm:
+            max_vm = vm
+        if eid in allowable_map and vm > allowable_map[eid]:
+            failed.append((eid, vm, allowable_map[eid]))
+    return len(failed) == 0, failed, max_vm
+
+
+def compute_average_stress_per_pid(stress_map, eid_pid_map, eid_area_map, sigma_count=1):
+    """Her property icin agirlikli ortalama stress ve sigma hesaplar.
+    avg_stress = sum(stress_i * area_i) / sum(area_i)
+    sigma = sqrt(sum(area_i * (stress_i - avg)^2) / sum(area_i))
+    Returns: {pid: (avg_stress, sigma, avg+n*sigma, max_stress)}
+    """
+    # PID bazli eleman gruplama
+    pid_elements = {}  # {pid: [(stress, area), ...]}
+    for eid, stress in stress_map.items():
+        pid = eid_pid_map.get(eid)
+        if pid is None:
+            continue
+        area = eid_area_map.get(eid, 0.0)
+        if area <= 0:
+            continue
+        if pid not in pid_elements:
+            pid_elements[pid] = []
+        pid_elements[pid].append((stress, area))
+
+    result = {}
+    for pid, elems in pid_elements.items():
+        total_area = sum(a for _, a in elems)
+        if total_area <= 0:
+            continue
+
+        # Agirlikli ortalama
+        avg = sum(s * a for s, a in elems) / total_area
+
+        # Agirlikli standart sapma (sigma)
+        variance = sum(a * (s - avg) ** 2 for s, a in elems) / total_area
+        sigma = variance ** 0.5
+
+        # Property'deki max stress
+        max_stress = max(s for s, _ in elems)
+
+        # avg + n*sigma (max_stress'i asamaz)
+        avg_plus_sigma = avg + sigma_count * sigma
+        effective_stress = min(avg_plus_sigma, max_stress)
+
+        result[pid] = (avg, sigma, effective_stress, max_stress)
+
+    return result
+
+
+def do_stress_check(stress_map, allowable_map, stress_mode, sigma_count,
+                    eid_pid_map, eid_area_map):
+    """Stress moduna gore uygun stress kontrolu yapar.
+    Returns: (stress_ok, failed, max_vm)
+    """
+    if stress_mode == "Average Stress" and eid_pid_map and eid_area_map:
+        avg_data = compute_average_stress_per_pid(stress_map, eid_pid_map, eid_area_map, sigma_count)
+        return check_stress_constraints_average(avg_data, allowable_map)
+    else:
+        return check_stress_constraints(stress_map, allowable_map)
+
+
+def check_stress_constraints_average(avg_stress_data, prop_allowable_map):
+    """Average stress modunda property bazli stress kontrolu.
+    avg_stress_data: {pid: (avg, sigma, effective_stress, max_stress)}
+    prop_allowable_map: {pid: allowable}
+    Returns: (all_ok, failed_list, max_effective_stress)
+    """
+    failed = []
+    max_eff = 0.0
+    for pid, (avg, sigma, eff_stress, max_stress) in avg_stress_data.items():
+        if eff_stress > max_eff:
+            max_eff = eff_stress
+        if pid in prop_allowable_map and eff_stress > prop_allowable_map[pid]:
+            failed.append((pid, eff_stress, prop_allowable_map[pid]))
+    return len(failed) == 0, failed, max_eff
+
+
+def log_mass_summary(total_mass, max_disp, max_disp_limit, max_vm, stress_ok, log_callback,
+                     disp_direction="Mag"):
+    """Mass Summary: toplam mass, max displacement, max stress"""
+    disp_status = "OK" if max_disp <= max_disp_limit else "FAIL"
+    stress_status = "OK" if stress_ok else "FAIL"
+    disp_label = f"Max Disp ({disp_direction}):"
+    log_callback("")
+    log_callback("  ╔══════════════════════════════════════════╗")
+    log_callback("  ║           MASS SUMMARY                   ║")
+    log_callback("  ╠══════════════════════════════════════════╣")
+    log_callback(f"  ║  Total Mass:        {total_mass:>12.4f}  kg     ║")
+    log_callback(f"  ║  {disp_label:<20} {max_disp:>12.6f}  [{disp_status:>4}] ║")
+    log_callback(f"  ║  Max Von Mises:     {max_vm:>12.2f}  [{stress_status:>4}] ║")
+    log_callback("  ╚══════════════════════════════════════════╝")
+    log_callback("")
+
+
+def solve_and_evaluate(nastran_exe, bdf_path, thickness_map, work_dir, log_callback, memory_mb=0, scratch_dir=None,
+                       disp_direction="Mag"):
+    """BDF'yi değiştir, çöz, sonuçları oku, CSV yaz, OP2 ve büyük dosyaları sil."""
+    os.makedirs(work_dir, exist_ok=True)
+    bdf_basename = os.path.basename(bdf_path)
+    modified_bdf = os.path.join(work_dir, bdf_basename)
+    modify_pshell_thicknesses(bdf_path, modified_bdf, thickness_map, log_callback)
+
+    op2_path = run_nastran(nastran_exe, modified_bdf, work_dir, log_callback, memory_mb=memory_mb, scratch_dir=scratch_dir)
+    op2_model = _read_op2_with_retry(op2_path, log_callback)
+    # İlk başarılı okumadan referans boyutu kaydet
+    global _ref_op2_size
+    with _ref_op2_lock:
+        if _ref_op2_size == 0:
+            _sz = os.path.getsize(op2_path)
+            if _sz > 102400:
+                _ref_op2_size = _sz
+
+    max_disp = get_max_absolute_displacement(op2_model, direction=disp_direction)
+    stress_map = get_von_mises_stresses(op2_model)
+
+    # Çoklu subcase: her subcase'in displacement max'ini logla
+    if op2_model.displacements and len(op2_model.displacements) > 1:
+        parts = []
+        for sc_id, d_obj in op2_model.displacements.items():
+            t = d_obj.data[:, :, :3]
+            sc_max = float(np.max(np.sqrt(np.sum(t ** 2, axis=2))))
+            parts.append(f"LC{sc_id}:{sc_max:.4f}")
+        log_callback(f"  Subcase disp → {', '.join(parts)} | toplam max={max_disp:.6f}")
+
+    iter_label = os.path.basename(work_dir)
+    extract_results_csv(op2_model, work_dir, iter_label, log_callback)
+
+    # OP2 ve diğer büyük Nastran çıktı dosyalarını sil (CSV'ler korunur)
+    del op2_model
+    cleanup_nastran_outputs(work_dir, log_callback)
+
+    return max_disp, stress_map
+
+
+def cleanup_nastran_outputs(work_dir, log_callback):
+    """OP2, f06, f04, log, DBALL, MASTER gibi büyük Nastran dosyalarını siler."""
+    extensions = ("*.op2", "*.f06", "*.f04", "*.log", "*.DBALL", "*.MASTER",
+                  "*.IFPDAT", "*.nx_pre_prc", "*.pch")
+    deleted = 0
+    for ext in extensions:
+        for fpath in globmod.glob(os.path.join(work_dir, ext)):
+            try:
+                os.remove(fpath)
+                deleted += 1
+            except OSError:
+                pass
+    if deleted:
+        log_callback(f"  {deleted} Nastran çıktı dosyası silindi.")
+
+
+def solve_batch(nastran_exe, bdf_path, batch_items, n_parallel, log_callback, memory_mb=0, scratch_dir=None,
+                disp_direction="Mag"):
+    """
+    Birden fazla thickness kombinasyonunu paralel olarak çözer.
+    batch_items: [(thickness_map, work_dir), ...]
+    Returns: [(thickness_map, max_disp, stress_map), ...] - aynı sırada
+    """
+    results = [None] * len(batch_items)
+
+    def _solve_one(idx, thickness_map, work_dir):
+        try:
+            max_disp, stress_map = solve_and_evaluate(
+                nastran_exe, bdf_path, thickness_map, work_dir, log_callback, memory_mb=memory_mb,
+                scratch_dir=scratch_dir, disp_direction=disp_direction
+            )
+            return idx, thickness_map, max_disp, stress_map
+        except Exception as exc:
+            log_callback(f"  [Hata] İterasyon '{os.path.basename(work_dir)}': {exc}")
+            return idx, thickness_map, 1e10, {}
+
+    with ThreadPoolExecutor(max_workers=n_parallel) as executor:
+        futures = {executor.submit(_solve_one, idx, t_map, w_dir): idx
+                   for idx, (t_map, w_dir) in enumerate(batch_items)}
+
+        for future in as_completed(futures):
+            try:
+                idx, t_map, max_disp, stress_map = future.result()
+                results[idx] = (t_map, max_disp, stress_map)
+            except Exception as exc:
+                idx = futures[future]
+                log_callback(f"  [Hata] Batch item #{idx} beklenmeyen thread hatası: {exc}")
+                results[idx] = (batch_items[idx][0], 1e10, {})
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# İterasyon Tracker (grafik + mass summary için)
+# ---------------------------------------------------------------------------
+
+class IterationTracker:
+    """Her iterasyonun mass, displacement, stress bilgisini tutar ve grafiğe çizer."""
+
+    def __init__(self, pid_mid_map, mid_density_map, pid_area_map,
+                 max_disp_limit, plot_callback, iter_file=None):
+        self.pid_mid_map = pid_mid_map
+        self.mid_density_map = mid_density_map
+        self.pid_area_map = pid_area_map
+        self.max_disp_limit = max_disp_limit
+        self.plot_callback = plot_callback
+        self.iter_file = iter_file
+
+        self.iterations = []
+        self.masses = []
+        self.displacements = []
+        self.stresses = []
+        self.thickness_maps = []
+        self.stress_ok_list = []
+
+    def record(self, iteration_label, thickness_map, max_disp, max_vm, stress_ok,
+               allowable_map, log_callback):
+        """Bir iterasyonu kaydet, mass summary bas, grafiği güncelle."""
+        if max_disp >= 1e9:
+            log_callback(f"  [{iteration_label}] Nastran başarısız, iterasyon atlanıyor.")
+            return 0.0
+        total_mass, _ = compute_real_mass(
+            thickness_map, self.pid_mid_map, self.mid_density_map, self.pid_area_map
+        )
+
+        self.iterations.append(len(self.iterations) + 1)
+        self.masses.append(total_mass)
+        self.displacements.append(max_disp)
+        self.stresses.append(max_vm)
+        self.thickness_maps.append(dict(thickness_map))
+        self.stress_ok_list.append(stress_ok)
+
+        log_mass_summary(total_mass, max_disp, self.max_disp_limit, max_vm, stress_ok, log_callback)
+
+        # İterasyon sonuçlarını dosyaya yaz
+        if self.iter_file is not None:
+            try:
+                self.iter_file.write(
+                    f"{len(self.iterations):>6}  {iteration_label:<22}  "
+                    f"{total_mass:>12.6f}  {max_disp:>12.6f}  {max_vm:>12.2f}  "
+                    f"{'OK' if stress_ok else 'FAIL'}\n"
+                )
+                self.iter_file.flush()
+            except Exception:
+                pass
+
+        # Grafiği güncelle
+        self.plot_callback(self.iterations, self.masses, self.displacements, self.max_disp_limit)
+
+        return total_mass
+
+    def get_best_feasible(self, max_disp_limit):
+        """Tüm iterasyonlar içinde displacement ve stress kısıtlarını sağlayan
+        en düşük kütleli thickness_map'i döndürür. Yoksa (None, inf) döner."""
+        best_mass = float('inf')
+        best_t = None
+        for i in range(len(self.iterations)):
+            if (self.displacements[i] <= max_disp_limit and
+                    self.stress_ok_list[i] and
+                    self.masses[i] < best_mass):
+                best_mass = self.masses[i]
+                best_t = self.thickness_maps[i]
+        return best_t, best_mass
+
+    def get_pareto_front(self):
+        """Non-dominated çözümler: min mass AND min max_disp."""
+        n = len(self.masses)
+        pareto = []
+        for i in range(n):
+            dominated = False
+            for j in range(n):
+                if i == j:
+                    continue
+                if (self.masses[j] <= self.masses[i] and
+                        self.displacements[j] <= self.displacements[i] and
+                        (self.masses[j] < self.masses[i] or
+                         self.displacements[j] < self.displacements[i])):
+                    dominated = True
+                    break
+            if not dominated:
+                pareto.append({
+                    "mass": self.masses[i],
+                    "max_disp": self.displacements[i],
+                    "max_vm": self.stresses[i],
+                    "stress_ok": self.stress_ok_list[i],
+                    "thickness_map": self.thickness_maps[i],
+                })
+        return sorted(pareto, key=lambda x: x["mass"])
+
+
+# ---------------------------------------------------------------------------
+# Surrogate Model (lineer ridge regression; sklearn GB opsiyonel)
+# ---------------------------------------------------------------------------
+
+class SurrogateModel:
+    """max_disp ve max_vm için hızlı tahmin modeli.
+    Yeterli veri yoksa predict() None döner → tam Nastran çalışır."""
+    MIN_SAMPLES = 15
+    RIDGE_ALPHA = 1e-2
+
+    def __init__(self):
+        self.X, self.y_disp, self.y_vm = [], [], []
+        self.x_mean = self.x_std = None
+        self.w_disp = self.w_vm = None
+        self.fitted = False
+        self._use_gb = False
+        try:
+            from sklearn.ensemble import GradientBoostingRegressor
+            from sklearn.preprocessing import StandardScaler
+            self._gb_d = GradientBoostingRegressor(n_estimators=60, max_depth=3, random_state=0)
+            self._gb_v = GradientBoostingRegressor(n_estimators=60, max_depth=3, random_state=0)
+            self._scaler = StandardScaler()
+            self._use_gb = True
+        except ImportError:
+            pass
+
+    def add(self, x_vec, disp_val, vm_val):
+        if disp_val >= 1e9:
+            return
+        self.X.append(np.asarray(x_vec, dtype=float))
+        self.y_disp.append(float(disp_val))
+        self.y_vm.append(float(max(vm_val, 0.0)))
+
+    def fit(self):
+        n = len(self.X)
+        if n < self.MIN_SAMPLES:
+            return False
+        X = np.array(self.X)
+        self.x_mean = X.mean(axis=0)
+        self.x_std = np.where(X.std(axis=0) > 1e-10, X.std(axis=0), 1.0)
+        Xn = (X - self.x_mean) / self.x_std
+        if self._use_gb:
+            Xs = self._scaler.fit_transform(Xn)
+            self._gb_d.fit(Xs, self.y_disp)
+            self._gb_v.fit(Xs, self.y_vm)
+        else:
+            Xb = np.hstack([np.ones((n, 1)), Xn])
+            A = Xb.T @ Xb + self.RIDGE_ALPHA * np.eye(Xb.shape[1])
+            self.w_disp = np.linalg.solve(A, Xb.T @ np.array(self.y_disp))
+            self.w_vm = np.linalg.solve(A, Xb.T @ np.array(self.y_vm))
+        self.fitted = True
+        return True
+
+    def predict_batch(self, X_batch):
+        """(n, n_features) → (pred_disp array, pred_vm array) veya (None, None)."""
+        if not self.fitted:
+            return None, None
+        Xn = (np.asarray(X_batch, dtype=float) - self.x_mean) / self.x_std
+        if self._use_gb:
+            Xs = self._scaler.transform(Xn)
+            return self._gb_d.predict(Xs), self._gb_v.predict(Xs)
+        Xb = np.hstack([np.ones((len(Xn), 1)), Xn])
+        return Xb @ self.w_disp, Xb @ self.w_vm
+
+
+def _check_convergence(fit_history, patience, tol=1e-3):
+    """Son `patience` adımda göreceli iyileşme < tol ise True döner."""
+    if len(fit_history) < patience:
+        return False
+    ref = fit_history[-patience]
+    if abs(ref) < 1e-12:
+        return False
+    return abs(ref - fit_history[-1]) / abs(ref) < tol
+
+
+# ---------------------------------------------------------------------------
+
+def optimize_fd_sqp(bdf_path, nastran_exe, output_dir, pids, allowable_map,
+                    min_t, max_t, step, max_disp_limit, max_iter,
+                    log_callback, progress_callback, tracker, n_parallel=1, memory_mb=0,
+                    pid_bounds=None, stress_mode="Element Based", sigma_count=0,
+                    eid_pid_map=None, eid_area_map=None, scratch_dir=None, disp_direction="Mag", stop_event=None):
+    """Forward Difference ile gradyan hesaplayıp SciPy trust-constr (SQP) ile optimize eder."""
+    from scipy.optimize import minimize, NonlinearConstraint
+
+    n = len(pids)
+    eval_count = [0]
+    cache = {}
+
+    # Per-PID bounds
+    if pid_bounds:
+        bounds_list = [pid_bounds[pid] for pid in pids]  # [(tmin, tmax, step), ...]
+        pid_min = np.array([b[0] for b in bounds_list])
+        pid_max = np.array([b[1] for b in bounds_list])
+        pid_step = np.array([b[2] for b in bounds_list])
+    else:
+        pid_min = np.full(n, min_t)
+        pid_max = np.full(n, max_t)
+        pid_step = np.full(n, step)
+
+    log_callback(f"\n  FD + SQP - {n} PSHELL, Paralel: {n_parallel}")
+
+    def _eval_point(x, label_prefix="fd"):
+        """Bir noktayı çözer, cache'e bakar."""
+        key = tuple(round(v, 1) for v in x)
+        if key in cache:
+            return cache[key]
+        eval_count[0] += 1
+        t_map = {pid: round(float(x[i]), 1) for i, pid in enumerate(pids)}
+        work_dir = os.path.join(output_dir, f"{label_prefix}_eval{eval_count[0]}")
+        try:
+            max_disp, stress_map = solve_and_evaluate(
+                nastran_exe, bdf_path, t_map, work_dir, log_callback, memory_mb=memory_mb,
+                scratch_dir=scratch_dir, disp_direction=disp_direction
+            )
+            stress_ok, _, max_vm = do_stress_check(
+                stress_map, allowable_map, stress_mode, sigma_count,
+                eid_pid_map, eid_area_map)
+            tracker.record(f"FD_{eval_count[0]}", t_map, max_disp, max_vm, stress_ok,
+                           allowable_map, log_callback)
+            cache[key] = (max_disp, stress_map)
+            return max_disp, stress_map
+        except Exception as exc:
+            log_callback(f"  [Hata] Eval #{eval_count[0]} ({label_prefix}): {exc}")
+            cache[key] = (max_disp_limit * 10, {})
+            return max_disp_limit * 10, {}
+
+    def objective(x):
+        """Amaç: toplam ağırlığı minimize et (proxy: sum of thicknesses)."""
+        return np.sum(x)
+
+    def objective_grad(x):
+        """Gradyan sabit: her kalınlığın ağırlığa katkısı 1."""
+        return np.ones(n)
+
+    def disp_constraint_fun(x):
+        """Displacement constraint: max_disp döndürür."""
+        max_disp, _ = _eval_point(x, "sqp")
+        progress_callback(min(eval_count[0] / max_iter * 100, 99))
+        log_callback(f"  SQP Eval #{eval_count[0]}: sum(t)={np.sum(x):.4f}, disp={max_disp:.6f}")
+        return max_disp
+
+    def disp_constraint_jac(x):
+        """Forward difference ile displacement gradyanı hesaplar."""
+        log_callback(f"  FD gradyan hesaplanıyor...")
+        x0 = np.array(x, dtype=float)
+        f0, _ = _eval_point(x0, "fd_ref")
+
+        if n_parallel > 1:
+            # Paralel FD
+            batch_items = []
+            for i in range(n):
+                x_pert = x0.copy()
+                x_pert[i] += pid_step[i]
+                x_pert[i] = min(x_pert[i], pid_max[i])
+                t_map = {pid: float(x_pert[j]) for j, pid in enumerate(pids)}
+                w_dir = os.path.join(output_dir, f"fd_grad_{eval_count[0]}_p{i}")
+                batch_items.append((t_map, w_dir))
+
+            batch_results = solve_batch(nastran_exe, bdf_path, batch_items, n_parallel, log_callback, memory_mb=memory_mb, scratch_dir=scratch_dir, disp_direction=disp_direction)
+            grad = np.zeros(n)
+            for i, (_, pert_disp, _) in enumerate(batch_results):
+                grad[i] = (pert_disp - f0) / pid_step[i]
+                log_callback(f"    PID {pids[i]}: dDisp/dT = {grad[i]:.6f}")
+        else:
+            # Seri FD
+            grad = np.zeros(n)
+            for i in range(n):
+                x_pert = x0.copy()
+                x_pert[i] += pid_step[i]
+                x_pert[i] = min(x_pert[i], pid_max[i])
+                fi, _ = _eval_point(x_pert, "fd_pert")
+                grad[i] = (fi - f0) / pid_step[i]
+                log_callback(f"    PID {pids[i]}: dDisp/dT = {grad[i]:.6f}")
+
+        return grad
+
+    x0 = np.array([(pid_min[i] + pid_max[i]) / 2.0 for i in range(n)])
+    bounds = [(pid_min[i], pid_max[i]) for i in range(n)]
+
+    disp_constr = NonlinearConstraint(
+        disp_constraint_fun, -np.inf, max_disp_limit,
+        jac=disp_constraint_jac
+    )
+
+    def _sqp_stop_cb(x, state):
+        if stop_event is not None and stop_event.is_set():
+            log_callback("  SQP durduruldu.")
+            return True
+        return False
+
+    log_callback(f"  SQP optimizasyon başlıyor...")
+    result = minimize(
+        objective, x0, method="trust-constr",
+        jac=objective_grad,
+        bounds=bounds,
+        constraints=[disp_constr],
+        options={"maxiter": max_iter, "verbose": 0, "gtol": float(np.min(pid_step)) / 10},
+        callback=_sqp_stop_cb,
+    )
+
+    log_callback(f"\n  SQP sonucu: {result.message}")
+    final_t = {pid: round(float(result.x[i]), 1) for i, pid in enumerate(pids)}
+
+    final_dir = os.path.join(output_dir, "final_result")
+    final_disp, final_stress = solve_and_evaluate(
+        nastran_exe, bdf_path, final_t, final_dir, log_callback, memory_mb=memory_mb,
+        scratch_dir=scratch_dir, disp_direction=disp_direction
+    )
+    stress_ok, _, max_vm = do_stress_check(
+        final_stress, allowable_map, stress_mode, sigma_count,
+        eid_pid_map, eid_area_map)
+    tracker.record("Final", final_t, final_disp, max_vm, stress_ok, allowable_map, log_callback)
+
+    progress_callback(100)
+    return final_t, final_disp, final_stress
+
+
+# ---------------------------------------------------------------------------
+# ALGORİTMA 2: Genetic Algorithm (GA)
+# ---------------------------------------------------------------------------
+
+def optimize_genetic(bdf_path, nastran_exe, output_dir, pids, allowable_map,
+                     min_t, max_t, step, max_disp_limit, max_iter,
+                     log_callback, progress_callback, tracker, n_parallel=1, memory_mb=0,
+                     pid_mid_map=None, mid_density_map=None, pid_area_map=None,
+                     pid_bounds=None, stress_mode="Element Based", sigma_count=0,
+                     eid_pid_map=None, eid_area_map=None, scratch_dir=None, disp_direction="Mag",
+                     stop_event=None, conv_patience=30):
+    """Genetik Algoritma ile kalınlık optimizasyonu."""
+    n = len(pids)
+    eval_count = [0]
+
+    # Per-PID bounds
+    if pid_bounds:
+        bounds_list = [pid_bounds[pid] for pid in pids]
+        pid_min = np.array([b[0] for b in bounds_list])
+        pid_max = np.array([b[1] for b in bounds_list])
+        pid_step = np.array([b[2] for b in bounds_list])
+    else:
+        pid_min = np.full(n, min_t)
+        pid_max = np.full(n, max_t)
+        pid_step = np.full(n, step)
+
+    # GA parametreleri
+    pop_size = max(10, 2 * n)
+    n_generations = max_iter
+    crossover_rate = 0.8
+    mutation_rate = 0.2
+    elite_count = max(2, pop_size // 5)
+
+    # Gerçek kütle hesabı kullanılabilir mi?
+    use_real_mass = (pid_mid_map is not None and mid_density_map is not None
+                     and pid_area_map is not None)
+
+    log_callback(f"\n  Genetic Algorithm - {n} PSHELL")
+    log_callback(f"  Popülasyon: {pop_size}, Jenerasyon: {n_generations}, Paralel: {n_parallel}")
+    log_callback(f"  Crossover: {crossover_rate}, Mutation: {mutation_rate}, Elite: {elite_count}")
+    if use_real_mass:
+        log_callback(f"  Fitness: Gerçek kütle (t x area x density)")
+    else:
+        log_callback(f"  Fitness: sum(thicknesses)")
+
+    rng = np.random.RandomState(42)
+
+    def _calc_mass(t_map):
+        """Birey için kütle hesabı."""
+        if use_real_mass:
+            mass, _ = compute_real_mass(t_map, pid_mid_map, mid_density_map, pid_area_map)
+            return mass
+        return sum(t_map.values())
+
+    def _fitness(t_map, max_disp, stress_ok):
+        """Fitness: düşük gerçek kütle + constraint ihlali penaltisi."""
+        mass = _calc_mass(t_map)
+        penalty = 0.0
+        if max_disp > max_disp_limit:
+            penalty += 1000.0 * (max_disp - max_disp_limit)
+        if not stress_ok:
+            penalty += 1000.0
+        return mass + penalty
+
+    # İlk popülasyonu oluştur (Latin Hypercube benzeri)
+    population = np.zeros((pop_size, n))
+    for j in range(n):
+        vals = np.linspace(pid_min[j], pid_max[j], pop_size)
+        rng.shuffle(vals)
+        population[:, j] = vals
+
+    best_t = None
+    best_fitness = float('inf')
+    best_disp = float('inf')
+    best_stress = {}
+    _conv_hist_ga = []
+
+    for gen in range(n_generations):
+        if stop_event is not None and stop_event.is_set():
+            log_callback("  GA durduruldu.")
+            break
+        log_callback(f"\n{'='*50}")
+        log_callback(f"GA JENERASYON {gen + 1}/{n_generations}")
+        progress_callback((gen / n_generations) * 100)
+
+        # Popülasyonu değerlendir
+        fitness_scores = np.full(pop_size, float('inf'))
+        disp_results = np.zeros(pop_size)
+        stress_results = [None] * pop_size
+        stress_ok_results = [False] * pop_size
+        vm_results = np.zeros(pop_size)
+        mass_results = np.zeros(pop_size)
+        t_maps = [None] * pop_size
+
+        # Her birey için t_map oluştur
+        for i in range(pop_size):
+            t_maps[i] = {pid: round(float(population[i, j]), 1) for j, pid in enumerate(pids)}
+
+        if n_parallel > 1:
+            # Paralel değerlendirme
+            batch_items = []
+            for i in range(pop_size):
+                w_dir = os.path.join(output_dir, f"ga_gen{gen}_ind{i}")
+                batch_items.append((t_maps[i], w_dir))
+
+            log_callback(f"  {pop_size} birey paralel değerlendiriliyor...")
+            try:
+                batch_results = solve_batch(nastran_exe, bdf_path, batch_items, n_parallel, log_callback, memory_mb=memory_mb, scratch_dir=scratch_dir, disp_direction=disp_direction)
+            except Exception as exc:
+                log_callback(f"  [Hata] GA Gen {gen+1} batch başlatma hatası: {exc}")
+                batch_results = [(t_maps[i], 1e10, {}) for i in range(pop_size)]
+
+            for i, item in enumerate(batch_results):
+                try:
+                    if item is None:
+                        raise ValueError("Sonuç alınamadı")
+                    t_map, max_disp, stress_map = item
+                    stress_ok, _, max_vm = do_stress_check(
+                        stress_map, allowable_map, stress_mode, sigma_count,
+                        eid_pid_map, eid_area_map)
+                    disp_results[i] = max_disp
+                    stress_results[i] = stress_map
+                    stress_ok_results[i] = stress_ok
+                    vm_results[i] = max_vm
+                    mass_results[i] = _calc_mass(t_maps[i])
+                    fitness_scores[i] = _fitness(t_maps[i], max_disp, stress_ok)
+                    tracker.record(f"GA_G{gen+1}_{i+1}", t_maps[i], max_disp, max_vm, stress_ok,
+                                   allowable_map, log_callback)
+                except Exception as exc:
+                    log_callback(f"  [Hata] GA Gen {gen+1} Birey #{i+1} işleme hatası: {exc}")
+                    fitness_scores[i] = float('inf')
+        else:
+            # Seri değerlendirme
+            for i in range(pop_size):
+                eval_count[0] += 1
+                w_dir = os.path.join(output_dir, f"ga_gen{gen}_ind{i}")
+                try:
+                    max_disp, stress_map = solve_and_evaluate(
+                        nastran_exe, bdf_path, t_maps[i], w_dir, log_callback, memory_mb=memory_mb,
+                        scratch_dir=scratch_dir, disp_direction=disp_direction
+                    )
+                    stress_ok, _, max_vm = do_stress_check(
+                        stress_map, allowable_map, stress_mode, sigma_count,
+                        eid_pid_map, eid_area_map)
+                except Exception as exc:
+                    log_callback(f"  [Hata] GA Gen {gen+1} Birey #{i+1}: {exc}")
+                    max_disp = max_disp_limit * 10
+                    stress_ok = False
+                    stress_map = {}
+                    max_vm = 0.0
+
+                disp_results[i] = max_disp
+                stress_results[i] = stress_map
+                stress_ok_results[i] = stress_ok
+                vm_results[i] = max_vm
+                mass_results[i] = _calc_mass(t_maps[i])
+                fitness_scores[i] = _fitness(t_maps[i], max_disp, stress_ok)
+
+                tracker.record(f"GA_G{gen+1}_{i+1}", t_maps[i], max_disp, max_vm, stress_ok,
+                               allowable_map, log_callback)
+
+        # ---- Jenerasyon Özeti (satır satır) ----
+        log_callback(f"\n  --- Gen {gen + 1} Özet ---")
+        mass_unit = "kg" if use_real_mass else "sum(t)"
+        log_callback(f"  {'No':>4}  {'Mass':>12}  {'Max Disp':>12}  {'Stress':>8}  {'Feasible':>8}")
+        log_callback(f"  {'----':>4}  {'--------':>12}  {'--------':>12}  {'------':>8}  {'--------':>8}")
+        for i in range(pop_size):
+            feasible = "OK" if (disp_results[i] <= max_disp_limit and stress_ok_results[i]) else "FAIL"
+            log_callback(f"  {i+1:>4}  {mass_results[i]:>12.4f}  {disp_results[i]:>12.6f}  {vm_results[i]:>8.1f}  {feasible:>8}")
+
+        # En iyi bireyi güncelle (feasible + en hafif gerçek kütle)
+        gen_best_idx = np.argmin(fitness_scores)
+        if fitness_scores[gen_best_idx] < best_fitness:
+            best_fitness = fitness_scores[gen_best_idx]
+            best_t = dict(t_maps[gen_best_idx])
+            best_disp = disp_results[gen_best_idx]
+            best_stress = stress_results[gen_best_idx] if stress_results[gen_best_idx] else {}
+
+        gen_best_mass = mass_results[gen_best_idx]
+        gen_feasible_count = sum(1 for i in range(pop_size)
+                                 if disp_results[i] <= max_disp_limit and stress_ok_results[i])
+        log_callback(f"\n  Gen {gen+1} en iyi: Birey #{gen_best_idx+1}, "
+                     f"Mass={gen_best_mass:.4f} {mass_unit}, "
+                     f"Disp={disp_results[gen_best_idx]:.6f}")
+        log_callback(f"  Feasible birey: {gen_feasible_count}/{pop_size}")
+        _conv_hist_ga.append(best_fitness)
+        if _check_convergence(_conv_hist_ga, conv_patience):
+            log_callback(f"  GA: son {conv_patience} jenerasyonda iyileşme < 0.1%%, yakınsandı.")
+            break
+
+        # Yeni popülasyon oluştur
+        sorted_indices = np.argsort(fitness_scores)
+        new_population = np.zeros_like(population)
+
+        # Elitizm: en iyi bireyleri koru
+        for i in range(elite_count):
+            new_population[i] = population[sorted_indices[i]]
+
+        # Crossover ve mutasyon ile kalan bireyleri oluştur
+        for i in range(elite_count, pop_size):
+            # Tournament selection
+            p1_idx = sorted_indices[rng.randint(0, max(pop_size // 2, 2))]
+            p2_idx = sorted_indices[rng.randint(0, max(pop_size // 2, 2))]
+            parent1 = population[p1_idx]
+            parent2 = population[p2_idx]
+
+            # Crossover (BLX-alpha)
+            child = parent1.copy()
+            if rng.random_sample() < crossover_rate:
+                alpha = 0.5
+                for j in range(n):
+                    lo = min(parent1[j], parent2[j])
+                    hi = max(parent1[j], parent2[j])
+                    span = hi - lo
+                    child[j] = rng.uniform(lo - alpha * span, hi + alpha * span)
+
+            # Mutasyon
+            if rng.random_sample() < mutation_rate:
+                mut_idx = rng.randint(0, n)
+                child[mut_idx] += rng.normal(0, (pid_max[mut_idx] - pid_min[mut_idx]) * 0.1)
+
+            # Sınırları uygula ve step'e yuvarla
+            child = np.clip(child, pid_min, pid_max)
+            child = np.round(child / pid_step) * pid_step
+            child = np.clip(child, pid_min, pid_max)
+            new_population[i] = child
+
+        population = new_population
+
+    if best_t is None:
+        best_t = {pid: round(float(population[0, j]), 1) for j, pid in enumerate(pids)}
+
+    log_callback(f"\n{'='*50}")
+    log_callback("SON ÇÖZÜM")
+    final_dir = os.path.join(output_dir, "final_result")
+    final_disp, final_stress = solve_and_evaluate(
+        nastran_exe, bdf_path, best_t, final_dir, log_callback, memory_mb=memory_mb,
+        scratch_dir=scratch_dir, disp_direction=disp_direction
+    )
+    stress_ok, _, max_vm = do_stress_check(
+        final_stress, allowable_map, stress_mode, sigma_count,
+        eid_pid_map, eid_area_map)
+    tracker.record("Final", best_t, final_disp, max_vm, stress_ok, allowable_map, log_callback)
+
+    progress_callback(100)
+    return best_t, final_disp, final_stress
+
+
+# ---------------------------------------------------------------------------
+# ALGORİTMA 3: OC + sep-CMA-ES Hibrit
+# ---------------------------------------------------------------------------
+
+def compute_oc_sensitivities(thickness_map, stress_map, pid_mid_map,
+                              mid_density_map, mid_E_map,
+                              eid_pid_map, eid_area_map, pid_area_map):
+    """OP2 Von Mises stres verisinden strain energy bazlı OC sensitivitesi hesaplar.
+    Returns: (sensitivities {pid: B_i}, pid_SE {pid: strain_energy})
+    """
+    pid_SE = {pid: 0.0 for pid in thickness_map}
+    for eid, vm in stress_map.items():
+        pid = eid_pid_map.get(eid)
+        if pid is None or pid not in thickness_map:
+            continue
+        mid = pid_mid_map.get(pid)
+        E = mid_E_map.get(mid, 7e10)          # fallback: aluminyum civarı
+        t = thickness_map[pid]
+        A_e = eid_area_map.get(eid, 0.0)
+        pid_SE[pid] += (vm ** 2) / (2.0 * max(E, 1.0)) * t * A_e
+
+    # Sıfır SE olan PID'ler için küçük fallback (veri eksikliği durumu)
+    nonzero = [v for v in pid_SE.values() if v > 0.0]
+    avg_SE = (np.mean(nonzero) * 0.01) if nonzero else 1e-15
+    for pid in pid_SE:
+        if pid_SE[pid] == 0.0:
+            pid_SE[pid] = avg_SE
+
+    # B_i = SE_i / (rho_i * A_total_i * t_i^2)
+    sensitivities = {}
+    for pid, t in thickness_map.items():
+        mid = pid_mid_map.get(pid)
+        rho = mid_density_map.get(mid, 1.0)
+        A_total = max(pid_area_map.get(pid, 1.0), 1e-10)
+        denom = rho * A_total * max(t ** 2, 1e-10)
+        sensitivities[pid] = pid_SE[pid] / denom
+
+    return sensitivities, pid_SE
+
+
+def oc_update_step(thickness_map, sensitivities, pid_SE, pid_bounds,
+                   max_disp, max_disp_limit, move_limit=0.2, eta=0.5):
+    """OC güncelleme adımı: lambda bisection ile yeni kalınlıkları hesaplar.
+    Displacement tahmini için reciprocal approximation kullanır (Nastran çalışması yok).
+    """
+    pids_list = list(thickness_map.keys())
+    t_arr     = np.array([thickness_map[p]    for p in pids_list])
+    B_arr     = np.array([sensitivities[p]    for p in pids_list])
+    SE_arr    = np.array([pid_SE[p]           for p in pids_list])
+    SE_total  = max(float(SE_arr.sum()), 1e-30)
+    tmin_arr  = np.array([pid_bounds[p][0]    for p in pids_list])
+    tmax_arr  = np.array([pid_bounds[p][1]    for p in pids_list])
+    tstep_arr = np.array([pid_bounds[p][2]    for p in pids_list])
+
+    def t_new_fn(lam):
+        raw = t_arr * (B_arr / max(float(lam), 1e-30)) ** eta
+        raw = np.clip(raw, t_arr * (1.0 - move_limit), t_arr * (1.0 + move_limit))
+        return np.clip(raw, tmin_arr, tmax_arr)
+
+    def u_pred(lam):
+        tn = t_new_fn(lam)
+        ratio = np.where(tn > 1e-10, t_arr / tn, 1.0)
+        return max_disp * float((SE_arr * ratio).sum() / SE_total)
+
+    # Kısıt mevcut max kalınlık artışıyla (move_limit) bile sağlanamıyorsa → max'a it
+    if u_pred(1e-10) > max_disp_limit:
+        t_new = t_new_fn(1e-10)
+    else:
+        # lam_hi: u_pred > limit olan infeasible üst sınır
+        lam_lo = 1e-10
+        lam_hi = max(float(B_arr.max()) * 10.0, 1.0)
+        for _ in range(60):
+            if u_pred(lam_hi) > max_disp_limit:
+                break
+            lam_hi *= 2.0
+
+        # Bisection: en büyük feasible lambda = minimum kütle
+        for _ in range(60):
+            lam_mid = 0.5 * (lam_lo + lam_hi)
+            if u_pred(lam_mid) <= max_disp_limit:
+                lam_lo = lam_mid   # kısıt sağlandı → lambda artır (kütle azalt)
+            else:
+                lam_hi = lam_mid   # kısıt ihlali → lambda azalt
+
+        t_new = t_new_fn(lam_lo)
+    t_rounded = np.round(np.round(t_new / np.maximum(tstep_arr, 1e-10)) * tstep_arr, 1)
+    t_rounded = np.clip(t_rounded, tmin_arr, tmax_arr)
+    return {pids_list[i]: float(t_rounded[i]) for i in range(len(pids_list))}
+
+
+class SepCMAES:
+    """sep-CMA-ES: diyagonal kovaryans matrisli CMA-ES, büyük n için verimli.
+
+    Her nesil ask() → evaluate → tell() döngüsü ile çalışır.
+    pop_size = n_parallel olduğunda her nesil = 1 paralel Nastran turu.
+    """
+
+    def __init__(self, x0, sigma0, pop_size=None):
+        self.n = len(x0)
+        self.m = np.asarray(x0, dtype=float).copy()
+        self.sigma = float(sigma0)
+        self.d = np.ones(self.n)                  # diyagonal standart sapmalar
+
+        lam = pop_size or (4 + int(3.0 * np.log(max(self.n, 2))))
+        mu  = max(lam // 2, 1)
+        w_raw = np.log(mu + 0.5) - np.log(np.arange(1, mu + 1, dtype=float))
+        w = w_raw / w_raw.sum()
+        mu_eff = 1.0 / float((w ** 2).sum())
+
+        n = self.n
+        self.lam, self.mu, self.w, self.mu_eff = lam, mu, w, mu_eff
+
+        self.c_sigma = (mu_eff + 2.0) / (n + mu_eff + 5.0)
+        self.d_sigma = (1.0 + self.c_sigma
+                        + 2.0 * max(0.0, np.sqrt((mu_eff - 1.0) / (n + 1.0)) - 1.0))
+        self.chi_n   = n ** 0.5 * (1.0 - 1.0 / (4.0 * n) + 1.0 / (21.0 * n ** 2))
+        self.c_c  = (4.0 + mu_eff / n) / (n + 4.0 + 2.0 * mu_eff / n)
+        self.c1   = 2.0 / ((n + 1.3) ** 2 + mu_eff)
+        self.cmu  = min(1.0 - self.c1,
+                        2.0 * (mu_eff - 2.0 + 1.0 / mu_eff) / ((n + 2.0) ** 2 + mu_eff))
+        self.p_sigma = np.zeros(n)
+        self.p_c     = np.zeros(n)
+        self.gen = 0
+
+    def ask(self, rng):
+        """Lambda aday çözüm örnekle."""
+        self._last_xs_raw = self.m + self.sigma * rng.standard_normal((self.lam, self.n)) * self.d
+        return self._last_xs_raw.copy()
+
+    def tell(self, xs, fs):
+        """xs: (lam, n) değerlendirilen noktalar; fs: (lam,) fitness (minimize)."""
+        idx = np.argsort(fs)[:self.mu]
+        sel = xs[idx]
+        old_m = self.m.copy()
+        self.m = (self.w[:, None] * sel).sum(axis=0)
+        step  = (self.m - old_m) / self.sigma
+
+        # Step-size evolution path
+        self.p_sigma = ((1.0 - self.c_sigma) * self.p_sigma
+                        + np.sqrt(self.c_sigma * (2.0 - self.c_sigma) * self.mu_eff)
+                          * step / np.maximum(self.d, 1e-30))
+        norm_ps = float(np.linalg.norm(self.p_sigma))
+        self.sigma *= np.exp(self.c_sigma / self.d_sigma * (norm_ps / self.chi_n - 1.0))
+        self.sigma = float(np.clip(self.sigma, 1e-12, 1e4))
+
+        denom_hs = np.sqrt(1.0 - (1.0 - self.c_sigma) ** (2.0 * (self.gen + 1)))
+        h = float(norm_ps / max(denom_hs, 1e-30) / self.chi_n < 1.4 + 2.0 / (self.n + 1.0))
+
+        # Covariance evolution path
+        self.p_c = ((1.0 - self.c_c) * self.p_c
+                    + h * np.sqrt(self.c_c * (2.0 - self.c_c) * self.mu_eff) * step)
+
+        # Diyagonal kovaryans güncelleme
+        y_sel = (sel - old_m) / self.sigma
+        d_sq  = ((1.0 - self.c1 - self.cmu) * self.d ** 2
+                 + self.c1  * self.p_c ** 2
+                 + self.cmu * (self.w[:, None] * y_sel ** 2).sum(axis=0))
+        self.d = np.sqrt(np.maximum(d_sq, 1e-20))
+        self.gen += 1
+
+
+def optimize_oc_sepcmaes(bdf_path, nastran_exe, output_dir, pids, allowable_map,
+                          min_t, max_t, step, max_disp_limit, max_iter,
+                          log_callback, progress_callback, tracker, n_parallel=1, memory_mb=0,
+                          pid_mid_map=None, mid_density_map=None, pid_area_map=None,
+                          pid_bounds=None, stress_mode="Element Based", sigma_count=0,
+                          eid_pid_map=None, eid_area_map=None, scratch_dir=None,
+                          disp_direction="Mag", mid_E_map=None,
+                          stop_event=None, conv_patience=30):
+    """Hibrit OC + sep-CMA-ES optimizasyon.
+
+    Faz 1 — OC: strain energy sensitivitesi ile hızlı lokal yakınsama (1 run/iter).
+    Faz 2 — sep-CMA-ES: OC çözümünden global arama, pop_size=n_parallel ile
+             her nesil tek bir paralel Nastran turu.
+    """
+    n = len(pids)
+    if mid_E_map is None:
+        mid_E_map = {}
+
+    # Faz bölünmesi
+    oc_iters  = max(10, min(30, max_iter // 3))
+    cma_iters = max(1, max_iter - oc_iters)
+
+    # Per-PID sınırlar
+    if pid_bounds:
+        pid_min_d  = {p: pid_bounds[p][0] for p in pids}
+        pid_max_d  = {p: pid_bounds[p][1] for p in pids}
+        pid_step_d = {p: pid_bounds[p][2] for p in pids}
+    else:
+        pid_min_d  = {p: min_t  for p in pids}
+        pid_max_d  = {p: max_t  for p in pids}
+        pid_step_d = {p: step   for p in pids}
+
+    pid_bounds_full = {p: (pid_min_d[p], pid_max_d[p], pid_step_d[p]) for p in pids}
+    pid_min_arr  = np.array([pid_min_d[p]  for p in pids])
+    pid_max_arr  = np.array([pid_max_d[p]  for p in pids])
+    pid_step_arr = np.array([pid_step_d[p] for p in pids])
+
+    pop_size = max(n_parallel, 4 + int(3.0 * np.log(max(n, 2))))
+
+    log_callback(f"\n  OC + sep-CMA-ES Hibrit — {n} PSHELL, Paralel: {n_parallel}")
+    log_callback(f"  Faz 1 (OC): {oc_iters} seri iterasyon (1 Nastran/iter) — Paralel çalışma YOK")
+    log_callback(f"  Faz 2 (CMA-ES): {cma_iters} nesil, pop={pop_size} — Paralel çalışma: {n_parallel} eş zamanlı")
+
+    def _fitness(t_map, max_disp_val, stress_ok_val):
+        mass, _ = compute_real_mass(t_map, pid_mid_map, mid_density_map, pid_area_map)
+        penalty = 0.0
+        if max_disp_val > max_disp_limit:
+            penalty += 1000.0 * (max_disp_val - max_disp_limit)
+        if not stress_ok_val:
+            penalty += 500.0
+        return mass + penalty
+
+    # ── BAŞLANGIÇ: orta nokta ──────────────────────────────────────────────
+    current_t = {p: round(float((pid_min_d[p] + pid_max_d[p]) / 2.0), 1) for p in pids}
+
+    # ══════════════════════════════════════════════════════════════════════
+    # FAZ 1: OC
+    # ══════════════════════════════════════════════════════════════════════
+    log_callback(f"\n{'='*50}")
+    log_callback("FAZ 1: Optimality Criteria (OC)")
+    log_callback("  Strain energy bazlı sensitivite — 1 Nastran / iterasyon")
+
+    oc_best_t    = None
+    oc_best_mass = float('inf')
+
+    for oc_i in range(oc_iters):
+        if stop_event is not None and stop_event.is_set():
+            log_callback("  OC durduruldu.")
+            break
+        progress_callback((oc_i / max_iter) * 100.0)
+        work_dir = os.path.join(output_dir, f"oc_iter{oc_i + 1}")
+        try:
+            max_disp, stress_map = solve_and_evaluate(
+                nastran_exe, bdf_path, current_t, work_dir, log_callback,
+                memory_mb=memory_mb, scratch_dir=scratch_dir,
+                disp_direction=disp_direction
+            )
+            stress_ok, _, max_vm = do_stress_check(
+                stress_map, allowable_map, stress_mode, sigma_count,
+                eid_pid_map, eid_area_map)
+            tracker.record(f"OC_{oc_i + 1}", current_t, max_disp, max_vm, stress_ok,
+                           allowable_map, log_callback)
+
+            log_callback(f"  OC {oc_i+1}/{oc_iters}: disp={max_disp:.6f} "
+                         f"({'OK' if max_disp <= max_disp_limit else 'FAIL'}), "
+                         f"stress={'OK' if stress_ok else 'FAIL'}")
+
+            # En iyi feasible OC çözümünü sakla
+            if max_disp <= max_disp_limit and stress_ok:
+                mass_now, _ = compute_real_mass(
+                    current_t, pid_mid_map, mid_density_map, pid_area_map)
+                if mass_now < oc_best_mass:
+                    oc_best_mass = mass_now
+                    oc_best_t = dict(current_t)
+
+            # OC sensitivite + güncelleme
+            sensitivities, pid_SE = compute_oc_sensitivities(
+                current_t, stress_map, pid_mid_map, mid_density_map, mid_E_map,
+                eid_pid_map, eid_area_map, pid_area_map
+            )
+            current_t = oc_update_step(
+                current_t, sensitivities, pid_SE, pid_bounds_full,
+                max_disp, max_disp_limit, move_limit=0.2, eta=0.5
+            )
+        except Exception as exc:
+            log_callback(f"  [Hata] OC iterasyon {oc_i + 1}: {exc}")
+
+    if oc_best_t is not None:
+        cma_start = oc_best_t
+        log_callback(f"\n  OC bitti — en iyi feasible kütle: {oc_best_mass:.4f} kg")
+    else:
+        cma_start = current_t
+        log_callback("\n  OC bitti — feasible çözüm bulunamadı, son iterasyondan devam")
+
+    # ══════════════════════════════════════════════════════════════════════
+    # FAZ 2: sep-CMA-ES
+    # ══════════════════════════════════════════════════════════════════════
+    log_callback(f"\n{'='*50}")
+    log_callback(f"FAZ 2: sep-CMA-ES  (pop={pop_size}, nesil={cma_iters})")
+
+    x0 = np.array([cma_start.get(p, (pid_min_d[p] + pid_max_d[p]) / 2.0) for p in pids])
+    sigma0 = float(np.mean(pid_max_arr - pid_min_arr) * 0.1)
+
+    cma   = SepCMAES(x0, sigma0, pop_size=pop_size)
+    rng   = np.random.RandomState(42)
+
+    cma_best_t       = None
+    cma_best_fitness = float('inf')
+    cma_best_disp    = float('inf')
+    cma_best_stress  = {}
+    _conv_hist_cma   = []
+
+    for cma_gen in range(cma_iters):
+        if stop_event is not None and stop_event.is_set():
+            log_callback("  CMA-ES durduruldu.")
+            break
+        progress_callback(((oc_iters + cma_gen) / max_iter) * 100.0)
+
+        # Örnekle ve sınırlara kırp
+        raw = cma.ask(rng)
+        samples = np.clip(raw, pid_min_arr, pid_max_arr)
+        samples = np.round(samples / np.maximum(pid_step_arr, 1e-10)) * pid_step_arr
+        samples = np.round(np.clip(samples, pid_min_arr, pid_max_arr), 1)
+
+        t_maps = [
+            {pids[j]: float(samples[i, j]) for j in range(n)}
+            for i in range(cma.lam)
+        ]
+
+        fitnesses = np.full(cma.lam, float('inf'))
+
+        if n_parallel > 1:
+            batch_items = [
+                (t_maps[i], os.path.join(output_dir, f"cma_g{cma_gen+1}_i{i}"))
+                for i in range(cma.lam)
+            ]
+            try:
+                batch_results = solve_batch(
+                    nastran_exe, bdf_path, batch_items, n_parallel,
+                    log_callback, memory_mb=memory_mb, scratch_dir=scratch_dir,
+                    disp_direction=disp_direction
+                )
+            except Exception as exc:
+                log_callback(f"  [Hata] CMA-ES Gen {cma_gen+1} batch: {exc}")
+                batch_results = [(t_maps[i], 1e10, {}) for i in range(cma.lam)]
+
+            for i, item in enumerate(batch_results):
+                try:
+                    if item is None:
+                        continue
+                    t_map, max_disp, stress_map = item
+                    stress_ok, _, max_vm = do_stress_check(
+                        stress_map, allowable_map, stress_mode, sigma_count,
+                        eid_pid_map, eid_area_map)
+                    fitnesses[i] = _fitness(t_maps[i], max_disp, stress_ok)
+                    tracker.record(f"CMA_G{cma_gen+1}_{i+1}", t_maps[i], max_disp, max_vm,
+                                   stress_ok, allowable_map, log_callback)
+                    if fitnesses[i] < cma_best_fitness:
+                        cma_best_fitness = fitnesses[i]
+                        cma_best_t       = dict(t_maps[i])
+                        cma_best_disp    = max_disp
+                        cma_best_stress  = stress_map or {}
+                except Exception as exc:
+                    log_callback(f"  [Hata] CMA-ES Gen {cma_gen+1} Birey #{i+1}: {exc}")
+        else:
+            for i in range(cma.lam):
+                work_dir = os.path.join(output_dir, f"cma_g{cma_gen+1}_i{i}")
+                try:
+                    max_disp, stress_map = solve_and_evaluate(
+                        nastran_exe, bdf_path, t_maps[i], work_dir, log_callback,
+                        memory_mb=memory_mb, scratch_dir=scratch_dir,
+                        disp_direction=disp_direction
+                    )
+                    stress_ok, _, max_vm = do_stress_check(
+                        stress_map, allowable_map, stress_mode, sigma_count,
+                        eid_pid_map, eid_area_map)
+                    fitnesses[i] = _fitness(t_maps[i], max_disp, stress_ok)
+                    tracker.record(f"CMA_G{cma_gen+1}_{i+1}", t_maps[i], max_disp, max_vm,
+                                   stress_ok, allowable_map, log_callback)
+                    if fitnesses[i] < cma_best_fitness:
+                        cma_best_fitness = fitnesses[i]
+                        cma_best_t       = dict(t_maps[i])
+                        cma_best_disp    = max_disp
+                        cma_best_stress  = stress_map or {}
+                except Exception as exc:
+                    log_callback(f"  [Hata] CMA-ES Gen {cma_gen+1} Birey #{i+1}: {exc}")
+
+        cma.tell(samples, fitnesses)
+        best_i = int(np.argmin(fitnesses))
+        log_callback(f"  CMA Gen {cma_gen+1}/{cma_iters}: "
+                     f"best_fit={fitnesses[best_i]:.4f}, sigma={cma.sigma:.4f}")
+        _conv_hist_cma.append(float(fitnesses[best_i]))
+        if _check_convergence(_conv_hist_cma, conv_patience):
+            log_callback(f"  CMA-ES: son {conv_patience} nesilde iyileşme < 0.1%%, yakınsandı.")
+            break
+
+    # CMA-ES başlangıç noktası dönmüşse kullan
+    if cma_best_t is None:
+        cma_best_t = {pids[j]: round(float(cma.m[j]), 1) for j in range(n)}
+
+    # OC ve CMA-ES en iyilerini karşılaştır
+    if oc_best_t is not None:
+        cma_mass, _ = compute_real_mass(cma_best_t, pid_mid_map, mid_density_map, pid_area_map)
+        if oc_best_mass < cma_mass:
+            log_callback(f"\n  OC çözümü daha hafif ({oc_best_mass:.4f} < {cma_mass:.4f} kg) — OC kullanılıyor.")
+            best_t = oc_best_t
+        else:
+            best_t = cma_best_t
+    else:
+        best_t = cma_best_t
+
+    # Final çözüm
+    log_callback(f"\n{'='*50}")
+    log_callback("SON ÇÖZÜM")
+    final_dir = os.path.join(output_dir, "final_result")
+    final_disp, final_stress = solve_and_evaluate(
+        nastran_exe, bdf_path, best_t, final_dir, log_callback,
+        memory_mb=memory_mb, scratch_dir=scratch_dir,
+        disp_direction=disp_direction
+    )
+    stress_ok, _, max_vm = do_stress_check(
+        final_stress, allowable_map, stress_mode, sigma_count,
+        eid_pid_map, eid_area_map)
+    tracker.record("Final", best_t, final_disp, max_vm, stress_ok, allowable_map, log_callback)
+
+    progress_callback(100)
+    return best_t, final_disp, final_stress
+
+
+# ---------------------------------------------------------------------------
+# ALGORİTMA 4: Standalone OC  (seri koşturma için optimize, 1 run/iter)
+# ---------------------------------------------------------------------------
+
+def optimize_oc(bdf_path, nastran_exe, output_dir, pids, allowable_map,
+                min_t, max_t, step, max_disp_limit, max_iter,
+                log_callback, progress_callback, tracker, n_parallel=1, memory_mb=0,
+                pid_mid_map=None, mid_density_map=None, pid_area_map=None,
+                pid_bounds=None, stress_mode="Element Based", sigma_count=0,
+                eid_pid_map=None, eid_area_map=None, scratch_dir=None,
+                disp_direction="Mag", mid_E_map=None,
+                stop_event=None, conv_patience=30):
+    """Standalone Optimality Criteria (OC) optimizasyonu.
+
+    n=200-500 PID için seri koşturmada en verimli seçim:
+    Her iterasyon yalnızca 1 Nastran çalışması gerektirir.
+    Strain energy bazlı sensitivite + lambda bisection ile kalınlık günceller.
+    Yakınsama ~30-80 iterasyonda, toplam Nastran: max_iter kadar.
+    """
+    n = len(pids)
+    if mid_E_map is None:
+        mid_E_map = {}
+
+    if pid_bounds:
+        pid_min_d  = {p: pid_bounds[p][0] for p in pids}
+        pid_max_d  = {p: pid_bounds[p][1] for p in pids}
+        pid_step_d = {p: pid_bounds[p][2] for p in pids}
+    else:
+        pid_min_d  = {p: min_t for p in pids}
+        pid_max_d  = {p: max_t for p in pids}
+        pid_step_d = {p: step  for p in pids}
+
+    pid_bounds_full = {p: (pid_min_d[p], pid_max_d[p], pid_step_d[p]) for p in pids}
+
+    log_callback(f"\n  Standalone OC — {n} PSHELL, {max_iter} iterasyon, 1 run/iter")
+    log_callback("  Strain energy sensitivitesi (OP2'den) + lambda bisection")
+
+    # Başlangıç: orta nokta
+    current_t = {p: round(float((pid_min_d[p] + pid_max_d[p]) / 2.0), 1) for p in pids}
+
+    best_t    = None
+    best_mass = float('inf')
+    best_disp = float('inf')
+    best_stress_map = {}
+
+    # Move limit: başlangıçta geniş, yakınsadıkça daralır
+    prev_mass = float('inf')
+    stagnation = 0
+    _conv_hist = []
+
+    for it in range(max_iter):
+        if stop_event is not None and stop_event.is_set():
+            log_callback("  OC durduruldu.")
+            break
+
+        progress_callback((it / max_iter) * 100.0)
+        # Move limit azaltma: 5 iterasyon iyileşme yoksa sıkılaştır
+        move_limit = max(0.05, 0.3 * (0.95 ** stagnation))
+        work_dir = os.path.join(output_dir, f"oc_{it + 1}")
+        try:
+            max_disp, stress_map = solve_and_evaluate(
+                nastran_exe, bdf_path, current_t, work_dir, log_callback,
+                memory_mb=memory_mb, scratch_dir=scratch_dir,
+                disp_direction=disp_direction
+            )
+            stress_ok, _, max_vm = do_stress_check(
+                stress_map, allowable_map, stress_mode, sigma_count,
+                eid_pid_map, eid_area_map)
+            tracker.record(f"OC_{it + 1}", current_t, max_disp, max_vm, stress_ok,
+                           allowable_map, log_callback)
+
+            mass_now, _ = compute_real_mass(current_t, pid_mid_map, mid_density_map, pid_area_map)
+            log_callback(f"  OC {it+1}/{max_iter}: mass={mass_now:.4f} kg  "
+                         f"disp={'OK' if max_disp <= max_disp_limit else 'FAIL'}  "
+                         f"stress={'OK' if stress_ok else 'FAIL'}  "
+                         f"move_lim={move_limit:.3f}")
+
+            # En iyi feasible çözümü sakla
+            if max_disp <= max_disp_limit and stress_ok and mass_now < best_mass:
+                best_mass = mass_now
+                best_t = dict(current_t)
+                best_disp = max_disp
+                best_stress_map = dict(stress_map)
+
+            # Stagnation sayacı
+            if abs(mass_now - prev_mass) < 1e-4 * max(prev_mass, 1.0):
+                stagnation += 1
+            else:
+                stagnation = 0
+            prev_mass = mass_now
+
+            # Yakınsama kontrolü
+            _conv_hist.append(mass_now)
+            if _check_convergence(_conv_hist, conv_patience):
+                log_callback(f"  OC: son {conv_patience} iterasyonda iyileşme < 0.1%%, yakınsandı.")
+                break
+
+            # OC sensitivite + güncelleme
+            sensitivities, pid_SE = compute_oc_sensitivities(
+                current_t, stress_map, pid_mid_map, mid_density_map, mid_E_map,
+                eid_pid_map, eid_area_map, pid_area_map
+            )
+            current_t = oc_update_step(
+                current_t, sensitivities, pid_SE, pid_bounds_full,
+                max_disp, max_disp_limit, move_limit=move_limit, eta=0.5
+            )
+
+        except Exception as exc:
+            log_callback(f"  [Hata] OC iterasyon {it + 1}: {exc}")
+
+    if best_t is None:
+        best_t = current_t
+
+    # Final çözüm
+    log_callback(f"\n{'='*50}")
+    log_callback("SON ÇÖZÜM")
+    final_dir = os.path.join(output_dir, "final_result")
+    final_disp, final_stress = solve_and_evaluate(
+        nastran_exe, bdf_path, best_t, final_dir, log_callback,
+        memory_mb=memory_mb, scratch_dir=scratch_dir,
+        disp_direction=disp_direction
+    )
+    stress_ok, _, max_vm = do_stress_check(
+        final_stress, allowable_map, stress_mode, sigma_count,
+        eid_pid_map, eid_area_map)
+    tracker.record("Final", best_t, final_disp, max_vm, stress_ok, allowable_map, log_callback)
+
+    progress_callback(100)
+    return best_t, final_disp, final_stress
+
+
+# ---------------------------------------------------------------------------
+# ALGORİTMA 5: L-SHADE (Success-History based Adaptive DE)
+# ---------------------------------------------------------------------------
+
+def optimize_lshade(bdf_path, nastran_exe, output_dir, pids, allowable_map,
+                    min_t, max_t, step, max_disp_limit, max_iter,
+                    log_callback, progress_callback, tracker, n_parallel=1, memory_mb=0,
+                    pid_mid_map=None, mid_density_map=None, pid_area_map=None,
+                    pid_bounds=None, stress_mode="Element Based", sigma_count=0,
+                    eid_pid_map=None, eid_area_map=None, scratch_dir=None,
+                    disp_direction="Mag", stop_event=None,
+                    conv_patience=30, use_surrogate=False):
+    """L-SHADE: Success-History based Adaptive Differential Evolution.
+
+    Standart DE'ye göre iyileştirmeler:
+    - F ve CR adaptif: H=50 success history archive üzerinden Cauchy/Normal örnekleme
+    - Popülasyon lineer küçülür: N_init → N_min (population shrinking)
+    - Strateji: current-to-pbest/1/bin (pbest: üst p=%11'lik bireylerden)
+    - External archive: başarısız bireyler diversity için saklanır
+    - Weighted Lehmer mean ile history güncelleme
+    """
+    n = len(pids)
+
+    if pid_bounds:
+        pid_min_d  = {p: pid_bounds[p][0] for p in pids}
+        pid_max_d  = {p: pid_bounds[p][1] for p in pids}
+        pid_step_d = {p: pid_bounds[p][2] for p in pids}
+    else:
+        pid_min_d  = {p: min_t for p in pids}
+        pid_max_d  = {p: max_t for p in pids}
+        pid_step_d = {p: step  for p in pids}
+
+    pid_min_arr  = np.array([pid_min_d[p]  for p in pids])
+    pid_max_arr  = np.array([pid_max_d[p]  for p in pids])
+    pid_step_arr = np.array([pid_step_d[p] for p in pids])
+
+    H      = 50
+    p_frac = 0.11
+    N_init = n_parallel                   # nesil başına birey = paralel run sayısı
+    N_min  = max(4, n_parallel // 4)      # LPSR: ~%25'ine kadar küçül
+
+    M_F  = np.full(H, 0.5)
+    M_CR = np.full(H, 0.5)
+    h_idx = 0
+
+    log_callback(f"\n  L-SHADE — {n} PSHELL, N_init={N_init}→{N_min}, "
+                 f"H={H}, p={p_frac}, nesil={max_iter}, paralel={n_parallel}")
+
+    def _fitness(t_map, max_disp_val, stress_ok_val):
+        mass, _ = compute_real_mass(t_map, pid_mid_map, mid_density_map, pid_area_map)
+        penalty = 0.0
+        if max_disp_val > max_disp_limit:
+            penalty += 1000.0 * (max_disp_val - max_disp_limit)
+        if not stress_ok_val:
+            penalty += 500.0
+        return mass + penalty
+
+    def _to_t_map(x):
+        clipped = np.clip(x, pid_min_arr, pid_max_arr)
+        rounded = np.round(clipped / np.maximum(pid_step_arr, 1e-10)) * pid_step_arr
+        rounded = np.round(np.clip(rounded, pid_min_arr, pid_max_arr), 1)
+        return {pids[j]: float(rounded[j]) for j in range(n)}
+
+    rng = np.random.RandomState(42)
+
+    # Latin Hypercube başlangıç popülasyonu
+    population = np.zeros((N_init, n))
+    for j in range(n):
+        vals = np.linspace(pid_min_arr[j], pid_max_arr[j], N_init)
+        rng.shuffle(vals)
+        population[:, j] = vals
+
+    log_callback(f"\n  Başlangıç popülasyonu değerlendiriliyor ({N_init} birey)...")
+    t_maps_cur = [_to_t_map(population[i]) for i in range(N_init)]
+
+    if n_parallel > 1:
+        batch = [(t_maps_cur[i], os.path.join(output_dir, f"lshade_init_{i}"))
+                 for i in range(N_init)]
+        try:
+            results = solve_batch(nastran_exe, bdf_path, batch, n_parallel,
+                                  log_callback, memory_mb=memory_mb, scratch_dir=scratch_dir,
+                                  disp_direction=disp_direction)
+        except Exception as exc:
+            log_callback(f"  [Hata] L-SHADE başlangıç batch: {exc}")
+            results = [(t_maps_cur[i], 1e10, {}) for i in range(N_init)]
+    else:
+        results = []
+        for i in range(N_init):
+            try:
+                md, sm = solve_and_evaluate(
+                    nastran_exe, bdf_path, t_maps_cur[i],
+                    os.path.join(output_dir, f"lshade_init_{i}"), log_callback,
+                    memory_mb=memory_mb, scratch_dir=scratch_dir,
+                    disp_direction=disp_direction)
+                results.append((t_maps_cur[i], md, sm))
+            except Exception as exc:
+                log_callback(f"  [Hata] L-SHADE init birey #{i}: {exc}")
+                results.append((t_maps_cur[i], 1e10, {}))
+
+    fitness = np.full(N_init, float('inf'))
+    for i, item in enumerate(results):
+        if item is None:
+            continue
+        t_map, max_disp, stress_map = item
+        try:
+            stress_ok, _, max_vm = do_stress_check(
+                stress_map, allowable_map, stress_mode, sigma_count,
+                eid_pid_map, eid_area_map)
+            fitness[i] = _fitness(t_map, max_disp, stress_ok)
+            tracker.record(f"LS_init_{i+1}", t_maps_cur[i], max_disp, max_vm,
+                           stress_ok, allowable_map, log_callback)
+        except Exception as exc:
+            log_callback(f"  [Hata] L-SHADE init fitness #{i}: {exc}")
+
+    best_idx = int(np.argmin(fitness))
+    best_t_overall   = dict(t_maps_cur[best_idx])
+    best_fit_overall = fitness[best_idx]
+    archive = []
+    _conv_hist_ls = []
+
+    # Surrogate: init verisiyle fit
+    surrogate = SurrogateModel() if use_surrogate else None
+    if surrogate is not None:
+        for i, item in enumerate(results):
+            if item is not None:
+                tm, md, sm = item
+                so, _, mvm = do_stress_check(sm, allowable_map, stress_mode, sigma_count, eid_pid_map, eid_area_map)
+                surrogate.add(list(tm[p] for p in pids), md, mvm if mvm else 0.0)
+        if surrogate.fit():
+            log_callback(f"  Surrogate (sklearn={surrogate._use_gb}) init verisiyle eğitildi ({len(surrogate.X)} örnek)")
+        else:
+            log_callback("  Surrogate: yetersiz veri, devre dışı.")
+            surrogate = None
+
+    # ── Ana L-SHADE döngüsü ─────────────────────────────────────────────────
+    for gen in range(max_iter):
+        if stop_event is not None and stop_event.is_set():
+            log_callback("  L-SHADE durduruldu.")
+            break
+
+        progress_callback((gen / max_iter) * 100.0)
+
+        # Lineer popülasyon küçültme
+        N_t = max(N_min, round(N_init - (N_init - N_min) * gen / max(max_iter - 1, 1)))
+        if N_t < len(population):
+            worst_idx = np.argsort(fitness)[::-1][:len(population) - N_t]
+            keep_mask = np.ones(len(population), dtype=bool)
+            keep_mask[worst_idx] = False
+            population  = population[keep_mask]
+            fitness     = fitness[keep_mask]
+            t_maps_cur  = [t_maps_cur[k] for k in range(len(keep_mask)) if keep_mask[k]]
+        pop_now = len(population)
+
+        n_pbest = max(2, round(p_frac * pop_now))
+        pbest_indices = np.argsort(fitness)[:n_pbest]
+
+        S_F, S_CR, S_df = [], [], []
+        trials  = np.zeros((pop_now, n))
+        F_arr   = np.zeros(pop_now)
+        CR_arr  = np.zeros(pop_now)
+
+        for i in range(pop_now):
+            r_idx = rng.randint(0, H)
+            Fi = float(np.clip(rng.standard_cauchy() * 0.1 + M_F[r_idx], 0.0, 1.0))
+            while Fi <= 0:
+                Fi = float(np.clip(rng.standard_cauchy() * 0.1 + M_F[r_idx], 0.0, 1.0))
+            CRi = float(np.clip(rng.normal(M_CR[r_idx], 0.1), 0.0, 1.0))
+            F_arr[i], CR_arr[i] = Fi, CRi
+
+            pbest_i = int(pbest_indices[rng.randint(0, n_pbest)])
+            pbest_x = population[pbest_i].copy()
+
+            cands_pop = [k for k in range(pop_now) if k != i]
+            r1 = int(rng.choice(cands_pop))
+
+            combined = list(population) + list(archive)
+            r2_opts  = [k for k in range(len(combined)) if k != i]
+            if not r2_opts:
+                r2_opts = list(range(len(combined)))
+            r2   = int(rng.choice(r2_opts))
+            x_r2 = combined[r2]
+
+            mutant = (population[i]
+                      + Fi * (pbest_x - population[i])
+                      + Fi * (population[r1] - x_r2))
+            mutant = np.clip(mutant, pid_min_arr, pid_max_arr)
+
+            cross_mask = rng.random_sample(n) < CRi
+            cross_mask[rng.randint(0, n)] = True
+            trials[i] = np.where(cross_mask, mutant, population[i])
+
+        trial_t_maps = [_to_t_map(trials[i]) for i in range(pop_now)]
+
+        # Surrogate ön eleme: sadece en umut verici n_validate adayı Nastran ile çalıştır
+        nastran_indices = list(range(pop_now))
+        surrogate_results = {}
+        if surrogate is not None and surrogate.fitted and pop_now > n_parallel:
+            X_trials = np.array([[tm[p] for p in pids] for tm in trial_t_maps])
+            pred_d, pred_v = surrogate.predict_batch(X_trials)
+            if pred_d is not None:
+                pred_fit = np.array([_fitness(trial_t_maps[i], pred_d[i], pred_v[i] <= max(allowable_map.values(), default=1e9))
+                                     for i in range(pop_now)])
+                n_validate = max(n_parallel, pop_now // 3)
+                nastran_indices = list(np.argsort(pred_fit)[:n_validate])
+                for i in range(pop_now):
+                    if i not in nastran_indices:
+                        surrogate_results[i] = (trial_t_maps[i], max(0.0, float(pred_d[i])), {})
+
+        if n_parallel > 1:
+            batch = [(trial_t_maps[i], os.path.join(output_dir, f"lshade_g{gen+1}_i{i}"))
+                     for i in nastran_indices]
+            try:
+                real_res = solve_batch(nastran_exe, bdf_path, batch, n_parallel,
+                                       log_callback, memory_mb=memory_mb,
+                                       scratch_dir=scratch_dir,
+                                       disp_direction=disp_direction)
+            except Exception as exc:
+                log_callback(f"  [Hata] L-SHADE Gen {gen+1} batch: {exc}")
+                real_res = [(trial_t_maps[nastran_indices[k]], 1e10, {}) for k in range(len(nastran_indices))]
+            nastran_map = {nastran_indices[k]: real_res[k] for k in range(len(nastran_indices))}
+        else:
+            nastran_map = {}
+            for i in nastran_indices:
+                try:
+                    md, sm = solve_and_evaluate(
+                        nastran_exe, bdf_path, trial_t_maps[i],
+                        os.path.join(output_dir, f"lshade_g{gen+1}_i{i}"), log_callback,
+                        memory_mb=memory_mb, scratch_dir=scratch_dir,
+                        disp_direction=disp_direction)
+                    nastran_map[i] = (trial_t_maps[i], md, sm)
+                except Exception as exc:
+                    log_callback(f"  [Hata] L-SHADE Gen {gen+1} Birey #{i}: {exc}")
+                    nastran_map[i] = (trial_t_maps[i], 1e10, {})
+
+        trial_results = []
+        for i in range(pop_now):
+            if i in nastran_map:
+                trial_results.append(nastran_map[i])
+                if surrogate is not None:
+                    tm, md, sm = nastran_map[i]
+                    so, _, mvm = do_stress_check(sm, allowable_map, stress_mode, sigma_count, eid_pid_map, eid_area_map)
+                    surrogate.add([tm[p] for p in pids], md, mvm if mvm else 0.0)
+            else:
+                trial_results.append(surrogate_results.get(i, (trial_t_maps[i], 1e10, {})))
+
+        if surrogate is not None and (gen + 1) % 5 == 0:
+            surrogate.fit()
+
+        for i, item in enumerate(trial_results):
+            if item is None:
+                continue
+            try:
+                t_map, max_disp, stress_map = item
+                stress_ok, _, max_vm = do_stress_check(
+                    stress_map, allowable_map, stress_mode, sigma_count,
+                    eid_pid_map, eid_area_map)
+                trial_fit = _fitness(trial_t_maps[i], max_disp, stress_ok)
+                if i in nastran_map:  # sadece gerçek Nastran sonuçlarını kaydet
+                    tracker.record(f"LS_G{gen+1}_{i+1}", trial_t_maps[i], max_disp, max_vm,
+                                   stress_ok, allowable_map, log_callback)
+
+                if trial_fit <= fitness[i]:
+                    archive.append(population[i].copy())
+                    if len(archive) > pop_now:
+                        archive.pop(rng.randint(0, len(archive)))
+                    df = fitness[i] - trial_fit
+                    population[i]  = trials[i]
+                    t_maps_cur[i]  = trial_t_maps[i]
+                    fitness[i]     = trial_fit
+                    S_F.append(F_arr[i])
+                    S_CR.append(CR_arr[i])
+                    S_df.append(df)
+
+                if trial_fit < best_fit_overall:
+                    best_fit_overall = trial_fit
+                    best_t_overall   = dict(trial_t_maps[i])
+            except Exception as exc:
+                log_callback(f"  [Hata] L-SHADE Gen {gen+1} seçim #{i}: {exc}")
+
+        if S_F:
+            w_arr  = np.array(S_df, dtype=float)
+            w_arr /= max(w_arr.sum(), 1e-30)
+            S_F_a  = np.array(S_F)
+            S_CR_a = np.array(S_CR)
+            M_F[h_idx]  = float(np.clip(
+                (w_arr * S_F_a**2).sum() / max((w_arr * S_F_a).sum(), 1e-30), 0.01, 1.0))
+            M_CR[h_idx] = float(np.clip((w_arr * S_CR_a).sum(), 0.0, 1.0))
+            h_idx = (h_idx + 1) % H
+
+        best_idx = int(np.argmin(fitness))
+        log_callback(f"  L-SHADE Gen {gen+1}/{max_iter}: N={pop_now}, "
+                     f"best_fit={fitness[best_idx]:.4f}, "
+                     f"M_F={M_F[(h_idx-1)%H]:.3f}, M_CR={M_CR[(h_idx-1)%H]:.3f}")
+        _conv_hist_ls.append(fitness[best_idx])
+        if _check_convergence(_conv_hist_ls, conv_patience):
+            log_callback(f"  L-SHADE: son {conv_patience} nesilde iyileşme < 0.1%%, yakınsandı.")
+            break
+
+    log_callback(f"\n{'='*50}")
+    log_callback("SON ÇÖZÜM")
+    final_dir = os.path.join(output_dir, "final_result")
+    final_disp, final_stress = solve_and_evaluate(
+        nastran_exe, bdf_path, best_t_overall, final_dir, log_callback,
+        memory_mb=memory_mb, scratch_dir=scratch_dir,
+        disp_direction=disp_direction
+    )
+    stress_ok, _, max_vm = do_stress_check(
+        final_stress, allowable_map, stress_mode, sigma_count,
+        eid_pid_map, eid_area_map)
+    tracker.record("Final", best_t_overall, final_disp, max_vm, stress_ok,
+                   allowable_map, log_callback)
+
+    progress_callback(100)
+    return best_t_overall, final_disp, final_stress
+
+
+# ---------------------------------------------------------------------------
+# ALGORİTMA 6: PSO (Particle Swarm Optimization)
+# ---------------------------------------------------------------------------
+
+def optimize_pso(bdf_path, nastran_exe, output_dir, pids, allowable_map,
+                 min_t, max_t, step, max_disp_limit, max_iter,
+                 log_callback, progress_callback, tracker, n_parallel=1, memory_mb=0,
+                 pid_mid_map=None, mid_density_map=None, pid_area_map=None,
+                 pid_bounds=None, stress_mode="Element Based", sigma_count=0,
+                 eid_pid_map=None, eid_area_map=None, scratch_dir=None,
+                 disp_direction="Mag", stop_event=None,
+                 conv_patience=30, use_surrogate=False):
+    """PSO (Particle Swarm Optimization).
+
+    - w=0.729, c1=c2=1.49445 (Clerc & Kennedy 2002 constriction factor)
+    - v_max = (range) * 0.2  — hız kısıtlama
+    - Her nesil tüm partiküller paralel değerlendirilir
+    """
+    n = len(pids)
+
+    if pid_bounds:
+        pid_min_d  = {p: pid_bounds[p][0] for p in pids}
+        pid_max_d  = {p: pid_bounds[p][1] for p in pids}
+        pid_step_d = {p: pid_bounds[p][2] for p in pids}
+    else:
+        pid_min_d  = {p: min_t for p in pids}
+        pid_max_d  = {p: max_t for p in pids}
+        pid_step_d = {p: step  for p in pids}
+
+    pid_min_arr  = np.array([pid_min_d[p]  for p in pids])
+    pid_max_arr  = np.array([pid_max_d[p]  for p in pids])
+    pid_step_arr = np.array([pid_step_d[p] for p in pids])
+    v_max        = (pid_max_arr - pid_min_arr) * 0.2
+
+    pop_size = max(n_parallel, min(40, max(15, n // 5)))
+    w, c1, c2 = 0.729, 1.49445, 1.49445
+
+    log_callback(f"\n  PSO — {n} PSHELL, pop={pop_size}, "
+                 f"w={w}, c1={c1}, c2={c2}, nesil={max_iter}, paralel={n_parallel}")
+
+    def _fitness(t_map, max_disp_val, stress_ok_val):
+        mass, _ = compute_real_mass(t_map, pid_mid_map, mid_density_map, pid_area_map)
+        penalty = 0.0
+        if max_disp_val > max_disp_limit:
+            penalty += 1000.0 * (max_disp_val - max_disp_limit)
+        if not stress_ok_val:
+            penalty += 500.0
+        return mass + penalty
+
+    def _to_t_map(x):
+        clipped = np.clip(x, pid_min_arr, pid_max_arr)
+        rounded = np.round(clipped / np.maximum(pid_step_arr, 1e-10)) * pid_step_arr
+        rounded = np.round(np.clip(rounded, pid_min_arr, pid_max_arr), 1)
+        return {pids[j]: float(rounded[j]) for j in range(n)}
+
+    rng = np.random.RandomState(42)
+
+    # Latin Hypercube başlangıç pozisyonları
+    positions = np.zeros((pop_size, n))
+    for j in range(n):
+        vals = np.linspace(pid_min_arr[j], pid_max_arr[j], pop_size)
+        rng.shuffle(vals)
+        positions[:, j] = vals
+
+    velocities = (rng.random_sample((pop_size, n)) - 0.5) * v_max
+
+    log_callback(f"\n  Başlangıç sürüsü değerlendiriliyor ({pop_size} parçacık)...")
+    t_maps_init = [_to_t_map(positions[i]) for i in range(pop_size)]
+
+    if n_parallel > 1:
+        batch = [(t_maps_init[i], os.path.join(output_dir, f"pso_init_{i}"))
+                 for i in range(pop_size)]
+        try:
+            results = solve_batch(nastran_exe, bdf_path, batch, n_parallel,
+                                  log_callback, memory_mb=memory_mb, scratch_dir=scratch_dir,
+                                  disp_direction=disp_direction)
+        except Exception as exc:
+            log_callback(f"  [Hata] PSO başlangıç batch: {exc}")
+            results = [(t_maps_init[i], 1e10, {}) for i in range(pop_size)]
+    else:
+        results = []
+        for i in range(pop_size):
+            try:
+                md, sm = solve_and_evaluate(
+                    nastran_exe, bdf_path, t_maps_init[i],
+                    os.path.join(output_dir, f"pso_init_{i}"), log_callback,
+                    memory_mb=memory_mb, scratch_dir=scratch_dir,
+                    disp_direction=disp_direction)
+                results.append((t_maps_init[i], md, sm))
+            except Exception as exc:
+                log_callback(f"  [Hata] PSO init parçacık #{i}: {exc}")
+                results.append((t_maps_init[i], 1e10, {}))
+
+    fitness = np.full(pop_size, float('inf'))
+    for i, item in enumerate(results):
+        if item is None:
+            continue
+        t_map, max_disp, stress_map = item
+        try:
+            stress_ok, _, max_vm = do_stress_check(
+                stress_map, allowable_map, stress_mode, sigma_count,
+                eid_pid_map, eid_area_map)
+            fitness[i] = _fitness(t_map, max_disp, stress_ok)
+            tracker.record(f"PSO_init_{i+1}", t_maps_init[i], max_disp, max_vm,
+                           stress_ok, allowable_map, log_callback)
+        except Exception as exc:
+            log_callback(f"  [Hata] PSO init fitness #{i}: {exc}")
+
+    pbest_pos = positions.copy()
+    pbest_fit = fitness.copy()
+    gbest_idx = int(np.argmin(pbest_fit))
+    gbest_pos = pbest_pos[gbest_idx].copy()
+    gbest_fit = float(pbest_fit[gbest_idx])
+    best_t_overall = dict(t_maps_init[gbest_idx])
+
+    # Surrogate init
+    surrogate = SurrogateModel() if use_surrogate else None
+    if surrogate is not None:
+        for i, item in enumerate(results):
+            if item is None:
+                continue
+            _tm, _md, _sm = item
+            try:
+                _so, _, _mvm = do_stress_check(_sm, allowable_map, stress_mode, sigma_count,
+                                               eid_pid_map, eid_area_map)
+                surrogate.add([t_maps_init[i][p] for p in pids], _md, _mvm if _mvm else 0.0)
+            except Exception:
+                pass
+        if surrogate.fit():
+            log_callback(f"  Surrogate (sklearn={surrogate._use_gb}) başlangıç verisiyle eğitildi.")
+
+    # ── Ana PSO döngüsü ─────────────────────────────────────────────────────
+    _conv_hist_pso = []
+    for gen in range(max_iter):
+        if stop_event is not None and stop_event.is_set():
+            log_callback("  PSO durduruldu.")
+            break
+
+        progress_callback((gen / max_iter) * 100.0)
+
+        r1 = rng.random_sample((pop_size, n))
+        r2 = rng.random_sample((pop_size, n))
+        velocities = (w * velocities
+                      + c1 * r1 * (pbest_pos - positions)
+                      + c2 * r2 * (gbest_pos - positions))
+        velocities = np.clip(velocities, -v_max, v_max)
+        positions  = np.clip(positions + velocities, pid_min_arr, pid_max_arr)
+
+        trial_t_maps = [_to_t_map(positions[i]) for i in range(pop_size)]
+
+        # Surrogate pre-screening: evaluate only top n_validate candidates with Nastran
+        n_validate = max(n_parallel, pop_size // 3)
+        if surrogate is not None and surrogate.fitted:
+            _X = [[trial_t_maps[i][p] for p in pids] for i in range(pop_size)]
+            _pd, _pv = surrogate.predict_batch(_X)
+            if _pd is not None:
+                _sf = np.array([_fitness(trial_t_maps[i], max(float(_pd[i]), 0.0),
+                                         float(_pd[i]) <= max_disp_limit)
+                                for i in range(pop_size)])
+                validate_set = set(np.argsort(_sf)[:n_validate].tolist())
+            else:
+                validate_set = set(range(pop_size))
+        else:
+            validate_set = set(range(pop_size))
+
+        validated_idxs = sorted(validate_set)
+
+        if n_parallel > 1:
+            batch = [(trial_t_maps[i], os.path.join(output_dir, f"pso_g{gen+1}_i{i}"))
+                     for i in validated_idxs]
+            try:
+                batch_res = solve_batch(nastran_exe, bdf_path, batch, n_parallel,
+                                        log_callback, memory_mb=memory_mb,
+                                        scratch_dir=scratch_dir,
+                                        disp_direction=disp_direction)
+            except Exception as exc:
+                log_callback(f"  [Hata] PSO Gen {gen+1} batch: {exc}")
+                batch_res = [(trial_t_maps[i], 1e10, {}) for i in validated_idxs]
+            real_results = {validated_idxs[k]: batch_res[k] for k in range(len(validated_idxs))}
+        else:
+            real_results = {}
+            for i in validated_idxs:
+                try:
+                    md, sm = solve_and_evaluate(
+                        nastran_exe, bdf_path, trial_t_maps[i],
+                        os.path.join(output_dir, f"pso_g{gen+1}_i{i}"), log_callback,
+                        memory_mb=memory_mb, scratch_dir=scratch_dir,
+                        disp_direction=disp_direction)
+                    real_results[i] = (trial_t_maps[i], md, sm)
+                except Exception as exc:
+                    log_callback(f"  [Hata] PSO Gen {gen+1} Parçacık #{i}: {exc}")
+                    real_results[i] = (trial_t_maps[i], 1e10, {})
+
+        for i in range(pop_size):
+            try:
+                if i in real_results:
+                    item = real_results[i]
+                    if item is None:
+                        continue
+                    t_map, max_disp_i, stress_map_i = item
+                    stress_ok_i, _, max_vm_i = do_stress_check(
+                        stress_map_i, allowable_map, stress_mode, sigma_count,
+                        eid_pid_map, eid_area_map)
+                    fit_i = _fitness(trial_t_maps[i], max_disp_i, stress_ok_i)
+                    tracker.record(f"PSO_G{gen+1}_{i+1}", trial_t_maps[i], max_disp_i, max_vm_i,
+                                   stress_ok_i, allowable_map, log_callback)
+                    if surrogate is not None:
+                        surrogate.add([trial_t_maps[i][p] for p in pids], max_disp_i,
+                                      max_vm_i if max_vm_i else 0.0)
+                elif surrogate is not None and surrogate.fitted:
+                    _Xp = [[trial_t_maps[i][p] for p in pids]]
+                    _pd2, _ = surrogate.predict_batch(_Xp)
+                    if _pd2 is None:
+                        continue
+                    max_disp_i = max(float(_pd2[0]), 0.0)
+                    stress_ok_i = max_disp_i <= max_disp_limit
+                    fit_i = _fitness(trial_t_maps[i], max_disp_i, stress_ok_i)
+                else:
+                    continue
+
+                if fit_i < pbest_fit[i]:
+                    pbest_fit[i] = fit_i
+                    pbest_pos[i] = positions[i].copy()
+
+                if fit_i < gbest_fit:
+                    gbest_fit = fit_i
+                    gbest_pos = positions[i].copy()
+                    if i in real_results:
+                        best_t_overall = dict(trial_t_maps[i])
+            except Exception as exc:
+                log_callback(f"  [Hata] PSO Gen {gen+1} güncelleme #{i}: {exc}")
+
+        if surrogate is not None and (gen + 1) % 5 == 0:
+            if surrogate.fit():
+                log_callback(f"  Surrogate yenilendi (n={len(surrogate.X)})")
+
+        log_callback(f"  PSO Gen {gen+1}/{max_iter}: gbest_fit={gbest_fit:.4f}")
+        _conv_hist_pso.append(gbest_fit)
+        if _check_convergence(_conv_hist_pso, conv_patience):
+            log_callback(f"  PSO: son {conv_patience} nesilde iyileşme < 0.1%%, yakınsandı.")
+            break
+
+    log_callback(f"\n{'='*50}")
+    log_callback("SON ÇÖZÜM")
+    final_dir = os.path.join(output_dir, "final_result")
+    final_disp, final_stress = solve_and_evaluate(
+        nastran_exe, bdf_path, best_t_overall, final_dir, log_callback,
+        memory_mb=memory_mb, scratch_dir=scratch_dir,
+        disp_direction=disp_direction
+    )
+    stress_ok, _, max_vm = do_stress_check(
+        final_stress, allowable_map, stress_mode, sigma_count,
+        eid_pid_map, eid_area_map)
+    tracker.record("Final", best_t_overall, final_disp, max_vm, stress_ok,
+                   allowable_map, log_callback)
+
+    progress_callback(100)
+    return best_t_overall, final_disp, final_stress
+
+
+# ---------------------------------------------------------------------------
+# ALGORİTMA 7: SPSA (Simultaneous Perturbation Stochastic Approximation)
+# ---------------------------------------------------------------------------
+
+def optimize_spsa(bdf_path, nastran_exe, output_dir, pids, allowable_map,
+                  min_t, max_t, step, max_disp_limit, max_iter,
+                  log_callback, progress_callback, tracker, n_parallel=1, memory_mb=0,
+                  pid_mid_map=None, mid_density_map=None, pid_area_map=None,
+                  pid_bounds=None, stress_mode="Element Based", sigma_count=0,
+                  eid_pid_map=None, eid_area_map=None, scratch_dir=None,
+                  disp_direction="Mag", stop_event=None, conv_patience=30):
+    """SPSA (Simultaneous Perturbation Stochastic Approximation).
+
+    Her iterasyonda yalnızca 2 Nastran çalışması — n'den bağımsız.
+    Gradient tahmini: g_hat = (f(x+c*Δ) - f(x-c*Δ)) / (2c) * (1/Δ)
+    Δ: Bernoulli ±1 rastgele vektörü.
+    Gain sequences: Spall 1998 (alpha=0.602, gamma=0.101).
+    """
+    n = len(pids)
+
+    if pid_bounds:
+        pid_min_d  = {p: pid_bounds[p][0] for p in pids}
+        pid_max_d  = {p: pid_bounds[p][1] for p in pids}
+        pid_step_d = {p: pid_bounds[p][2] for p in pids}
+    else:
+        pid_min_d  = {p: min_t for p in pids}
+        pid_max_d  = {p: max_t for p in pids}
+        pid_step_d = {p: step  for p in pids}
+
+    pid_min_arr  = np.array([pid_min_d[p]  for p in pids])
+    pid_max_arr  = np.array([pid_max_d[p]  for p in pids])
+    pid_step_arr = np.array([pid_step_d[p] for p in pids])
+    mean_range   = float(np.mean(pid_max_arr - pid_min_arr))
+
+    alpha  = 0.602
+    gamma  = 0.101
+    A      = max_iter * 0.1
+    a_coef = float(np.mean(pid_step_arr)) * (1.0 + A) ** alpha
+    c_coef = max(float(np.mean(pid_step_arr)), 1e-6)
+
+    log_callback(f"\n  SPSA — {n} PSHELL, her iter 2 çözüm, max_iter={max_iter}")
+    log_callback(f"  Gain: a={a_coef:.4f}, c={c_coef:.4f}, A={A:.1f}")
+
+    def _fitness(t_map, max_disp_val, stress_ok_val):
+        mass, _ = compute_real_mass(t_map, pid_mid_map, mid_density_map, pid_area_map)
+        penalty = 0.0
+        if max_disp_val > max_disp_limit:
+            penalty += 1000.0 * (max_disp_val - max_disp_limit)
+        if not stress_ok_val:
+            penalty += 500.0
+        return mass + penalty
+
+    def _to_t_map(x):
+        clipped = np.clip(x, pid_min_arr, pid_max_arr)
+        rounded = np.round(clipped / np.maximum(pid_step_arr, 1e-10)) * pid_step_arr
+        rounded = np.round(np.clip(rounded, pid_min_arr, pid_max_arr), 1)
+        return {pids[j]: float(rounded[j]) for j in range(n)}
+
+    rng = np.random.RandomState(42)
+
+    x = (pid_min_arr + pid_max_arr) * 0.5
+    best_fit       = float('inf')
+    best_t_overall = _to_t_map(x)
+    _conv_hist_spsa = []
+
+    # ── Ana SPSA döngüsü ─────────────────────────────────────────────────────
+    for k in range(max_iter):
+        if stop_event is not None and stop_event.is_set():
+            log_callback("  SPSA durduruldu.")
+            break
+
+        progress_callback((k / max_iter) * 100.0)
+
+        a_k = a_coef / (k + 1.0 + A) ** alpha
+        c_k = max(c_coef / (k + 1.0) ** gamma, float(np.mean(pid_step_arr)) * 0.6)
+
+        delta   = rng.choice([-1.0, 1.0], size=n)
+        x_plus  = _to_t_map(x + c_k * delta)
+        x_minus = _to_t_map(x - c_k * delta)
+
+        batch = [
+            (x_plus,  os.path.join(output_dir, f"spsa_k{k+1}_plus")),
+            (x_minus, os.path.join(output_dir, f"spsa_k{k+1}_minus")),
+        ]
+        try:
+            pair_results = solve_batch(nastran_exe, bdf_path, batch, 2,
+                                       log_callback, memory_mb=memory_mb,
+                                       scratch_dir=scratch_dir,
+                                       disp_direction=disp_direction)
+        except Exception as exc:
+            log_callback(f"  [Hata] SPSA iter {k+1}: {exc}")
+            pair_results = [(x_plus, 1e10, {}), (x_minus, 1e10, {})]
+
+        f_vals = []
+        for idx_r, (t_map, max_disp, stress_map) in enumerate(pair_results):
+            try:
+                stress_ok, _, max_vm = do_stress_check(
+                    stress_map, allowable_map, stress_mode, sigma_count,
+                    eid_pid_map, eid_area_map)
+                fv = _fitness(t_map, max_disp, stress_ok)
+                f_vals.append(fv)
+                label = "+" if idx_r == 0 else "-"
+                tracker.record(f"SPSA_k{k+1}{label}", t_map, max_disp, max_vm,
+                               stress_ok, allowable_map, log_callback)
+                if fv < best_fit:
+                    best_fit       = fv
+                    best_t_overall = dict(t_map)
+            except Exception as exc:
+                log_callback(f"  [Hata] SPSA iter {k+1} fitness: {exc}")
+                f_vals.append(1e10)
+
+        if len(f_vals) == 2:
+            f_plus, f_minus = f_vals
+            g_hat = (f_plus - f_minus) / (2.0 * max(c_k, 1e-10) * delta)
+            x = np.clip(x - a_k * np.sign(g_hat), pid_min_arr, pid_max_arr)
+
+        log_callback(f"  SPSA k={k+1}/{max_iter}: a_k={a_k:.5f}, c_k={c_k:.5f}, "
+                     f"best_fit={best_fit:.4f}")
+        _conv_hist_spsa.append(best_fit)
+        if _check_convergence(_conv_hist_spsa, conv_patience):
+            log_callback(f"  SPSA: son {conv_patience} iterasyonda iyileşme < 0.1%%, yakınsandı.")
+            break
+
+    log_callback(f"\n{'='*50}")
+    log_callback("SON ÇÖZÜM")
+    final_dir = os.path.join(output_dir, "final_result")
+    final_disp, final_stress = solve_and_evaluate(
+        nastran_exe, bdf_path, best_t_overall, final_dir, log_callback,
+        memory_mb=memory_mb, scratch_dir=scratch_dir,
+        disp_direction=disp_direction
+    )
+    stress_ok, _, max_vm = do_stress_check(
+        final_stress, allowable_map, stress_mode, sigma_count,
+        eid_pid_map, eid_area_map)
+    tracker.record("Final", best_t_overall, final_disp, max_vm, stress_ok,
+                   allowable_map, log_callback)
+
+    progress_callback(100)
+    return best_t_overall, final_disp, final_stress
+
+
+# ---------------------------------------------------------------------------
+# Çıktı dosyası temizleme (saklama moduna göre)
+# ---------------------------------------------------------------------------
+
+def cleanup_scratch_dir(scratch_dir, log_callback):
+    """Analiz sonrasi scratch klasorunun icerigini tamamen siler."""
+    import shutil
+    if not scratch_dir or not os.path.isdir(scratch_dir):
+        return
+    deleted = 0
+    for item in os.listdir(scratch_dir):
+        item_path = os.path.join(scratch_dir, item)
+        try:
+            if os.path.isdir(item_path):
+                shutil.rmtree(item_path)
+            else:
+                os.remove(item_path)
+            deleted += 1
+        except OSError:
+            pass
+    if deleted:
+        log_callback(f"  Scratch klasoru temizlendi: {deleted} oge silindi ({scratch_dir})")
+
+
+def cleanup_iteration_outputs(output_dir, retain_mode, tracker, max_disp_limit,
+                              allowable_map, log_callback):
+    """Saklama moduna göre iterasyon çıktılarını temizler.
+    retain_mode:
+      'all'      - Hiçbir şey silme
+      'feasible' - Sadece kısıtları sağlayan iterasyonların dosyalarını tut
+      'optimum'  - Sadece en iyi (en düşük mass, feasible) sonucu tut
+    """
+    import shutil
+
+    if retain_mode == "all":
+        return
+
+    # Çıktı dizinindeki alt klasörleri listele (final_result hariç)
+    subdirs = []
+    for item in os.listdir(output_dir):
+        item_path = os.path.join(output_dir, item)
+        if os.path.isdir(item_path) and item != "final_result":
+            subdirs.append(item_path)
+
+    if retain_mode == "optimum":
+        # final_result dışındaki tüm alt klasörleri sil
+        deleted = 0
+        for d in subdirs:
+            try:
+                shutil.rmtree(d)
+                deleted += 1
+            except OSError:
+                pass
+        if deleted:
+            log_callback(f"  {deleted} ara iterasyon klasoru silindi (sadece en optimum sonuc saklandi).")
+
+    elif retain_mode == "feasible":
+        # Tracker'daki feasible olmayan iterasyonlara ait klasorleri sil
+        feasible_indices = set()
+        for i in range(len(tracker.iterations)):
+            disp = tracker.displacements[i]
+            if disp <= max_disp_limit:
+                feasible_indices.add(i)
+
+        deleted = 0
+        for d in subdirs:
+            dirname = os.path.basename(d)
+            # Iterasyon numarasini dirname'den cikar
+            keep = False
+            for idx in feasible_indices:
+                iter_num = idx + 1
+                if str(iter_num) in dirname:
+                    keep = True
+                    break
+            if not keep:
+                try:
+                    shutil.rmtree(d)
+                    deleted += 1
+                except OSError:
+                    pass
+        if deleted:
+            log_callback(f"  {deleted} ara iterasyon klasoru silindi (sadece feasible sonuclar saklandi).")
+
+
+# ---------------------------------------------------------------------------
+# Ana GUI Uygulaması
+# ---------------------------------------------------------------------------
+
+class NastranToolApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Thickness Optimization Tool | NX Nastran")
+        self.root.geometry("1100x750")
+        self.root.resizable(True, True)
+        self.use_excel_thickness = False
+        self.thickness_range_data = None
+        self._stop_event = threading.Event()
+        self._build_ui()
+
+    def _build_ui(self):
+        # Ana yatay bölme: sol (kontroller+log) / sağ (grafik)
+        paned = ttk.PanedWindow(self.root, orient=tk.HORIZONTAL)
+        paned.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+        # Sol panel
+        left_frame = ttk.Frame(paned)
+        paned.add(left_frame, weight=3)
+
+        main_frame = ttk.Frame(left_frame, padding=5)
+        main_frame.pack(fill=tk.BOTH, expand=True)
+
+        row = 0
+        ttk.Label(main_frame, text="BDF File:").grid(row=row, column=0, sticky=tk.W, pady=2)
+        self.bdf_entry = ttk.Entry(main_frame, width=45)
+        self.bdf_entry.grid(row=row, column=1, columnspan=2, sticky=tk.EW, padx=4)
+        ttk.Button(main_frame, text="Browse...", command=self._browse_bdf).grid(row=row, column=3)
+
+        row += 1
+        ttk.Label(main_frame, text="NX Nastran:").grid(row=row, column=0, sticky=tk.W, pady=2)
+        self.nastran_entry = ttk.Entry(main_frame, width=45)
+        self.nastran_entry.grid(row=row, column=1, columnspan=2, sticky=tk.EW, padx=4)
+        ttk.Button(main_frame, text="Browse...", command=lambda: select_file(
+            self.nastran_entry, "Select NX Nastran",
+            [("Executable", "*.exe *.bat"), ("All Files", "*.*")]
+        )).grid(row=row, column=3)
+
+        row += 1
+        ttk.Label(main_frame, text="Output Folder:").grid(row=row, column=0, sticky=tk.W, pady=2)
+        self.output_entry = ttk.Entry(main_frame, width=45)
+        self.output_entry.grid(row=row, column=1, columnspan=2, sticky=tk.EW, padx=4)
+        ttk.Button(main_frame, text="Browse...", command=lambda: select_directory(
+            self.output_entry, "Select Output Folder"
+        )).grid(row=row, column=3)
+
+        row += 1
+        ttk.Label(main_frame, text="Scratch Folder:").grid(row=row, column=0, sticky=tk.W, pady=2)
+        self.scratch_entry = ttk.Entry(main_frame, width=45)
+        self.scratch_entry.grid(row=row, column=1, columnspan=2, sticky=tk.EW, padx=4)
+        ttk.Button(main_frame, text="Browse...", command=lambda: select_directory(
+            self.scratch_entry, "Select Scratch Folder"
+        )).grid(row=row, column=3)
+
+        row += 1
+        ttk.Label(main_frame, text="Allowable Excel:").grid(row=row, column=0, sticky=tk.W, pady=2)
+        self.excel_entry = ttk.Entry(main_frame, width=45)
+        self.excel_entry.grid(row=row, column=1, columnspan=2, sticky=tk.EW, padx=4)
+        ttk.Button(main_frame, text="Browse...", command=lambda: select_file(
+            self.excel_entry, "Select Stress Allowable Excel",
+            [("Excel Files", "*.xlsx *.xls"), ("All Files", "*.*")]
+        )).grid(row=row, column=3)
+
+        row += 1
+        ttk.Separator(main_frame, orient=tk.HORIZONTAL).grid(
+            row=row, column=0, columnspan=4, sticky=tk.EW, pady=6
+        )
+
+        # Parametreler
+        row += 1
+        param_frame = ttk.LabelFrame(main_frame, text="Optimization Parameters", padding=6)
+        param_frame.grid(row=row, column=0, columnspan=4, sticky=tk.EW, pady=2)
+
+        ttk.Label(param_frame, text="Min T:").grid(row=0, column=0, sticky=tk.W, padx=2)
+        self.min_t_entry = ttk.Entry(param_frame, width=8)
+        self.min_t_entry.grid(row=0, column=1, padx=2)
+        self.min_t_entry.insert(0, "0.5")
+
+        ttk.Label(param_frame, text="Max T:").grid(row=0, column=2, sticky=tk.W, padx=2)
+        self.max_t_entry = ttk.Entry(param_frame, width=8)
+        self.max_t_entry.grid(row=0, column=3, padx=2)
+        self.max_t_entry.insert(0, "5.0")
+
+        ttk.Label(param_frame, text="Step:").grid(row=0, column=4, sticky=tk.W, padx=2)
+        self.step_entry = ttk.Entry(param_frame, width=8)
+        self.step_entry.grid(row=0, column=5, padx=2)
+        self.step_entry.insert(0, "0.1")
+
+        self.excel_thickness_btn = ttk.Button(
+            param_frame, text="Load T from Excel",
+            command=self._toggle_excel_thickness
+        )
+        self.excel_thickness_btn.grid(row=0, column=6, padx=4)
+
+        ttk.Label(param_frame, text="Max Disp:").grid(row=1, column=0, sticky=tk.W, padx=2, pady=(4, 0))
+        self.max_disp_entry = ttk.Entry(param_frame, width=8)
+        self.max_disp_entry.grid(row=1, column=1, padx=2, pady=(4, 0))
+        self.max_disp_entry.insert(0, "10.0")
+
+        ttk.Label(param_frame, text="Direction:").grid(row=1, column=2, sticky=tk.W, padx=(8, 2), pady=(4, 0))
+        self.disp_dir_var = tk.StringVar(value="Mag")
+        disp_dir_combo = ttk.Combobox(param_frame, textvariable=self.disp_dir_var,
+                                      values=["Mag", "X", "Y", "Z"], state="readonly", width=5)
+        disp_dir_combo.grid(row=1, column=3, padx=2, pady=(4, 0), sticky=tk.W)
+
+        self.max_iter_label_var = tk.StringVar(value="Max Iter (Suggested: 500):")
+        ttk.Label(param_frame, textvariable=self.max_iter_label_var).grid(row=1, column=4, sticky=tk.W, padx=2, pady=(4, 0))
+        self.max_iter_entry = ttk.Entry(param_frame, width=8)
+        self.max_iter_entry.grid(row=1, column=5, padx=2, pady=(4, 0))
+        self.max_iter_entry.insert(0, "500")
+
+        ttk.Label(param_frame, text="Memory (MB):").grid(row=2, column=0, sticky=tk.W, padx=2, pady=(4, 0))
+        self.memory_entry = ttk.Entry(param_frame, width=8)
+        self.memory_entry.grid(row=2, column=1, padx=2, pady=(4, 0))
+        self.memory_entry.insert(0, "0")
+        ttk.Label(param_frame, text="(0 = default)").grid(row=2, column=2, sticky=tk.W, padx=2, pady=(4, 0))
+
+        ttk.Label(param_frame, text="Paralel Run:").grid(row=2, column=3, sticky=tk.W, padx=(8, 2), pady=(4, 0))
+        self.n_parallel_entry = ttk.Entry(param_frame, width=8)
+        self.n_parallel_entry.grid(row=2, column=4, padx=2, pady=(4, 0))
+        self.n_parallel_entry.insert(0, "1")
+
+        ttk.Label(param_frame, text="Algorithm:").grid(row=3, column=0, sticky=tk.W, padx=2, pady=(4, 0))
+        self.algo_var = tk.StringVar()
+        algo_combo = ttk.Combobox(param_frame, textvariable=self.algo_var, state="readonly", width=32)
+        algo_combo["values"] = (
+            "OC + sep-CMA-ES (Hibrit)",
+            "OC Standalone (Seri, Hızlı)",
+            "L-SHADE (Adaptive DE)",
+            "PSO (Particle Swarm)",
+            "Genetic Algorithm (GA)",
+            "FD + SQP (Forward Difference)",
+        )
+        algo_combo.current(0)
+        algo_combo.grid(row=3, column=1, columnspan=4, sticky=tk.W, padx=2, pady=(4, 0))
+        algo_combo.bind("<<ComboboxSelected>>", self._on_algo_changed)
+
+        ttk.Label(param_frame, text="Save Results:").grid(row=4, column=0, sticky=tk.W, padx=2, pady=(4, 0))
+        self.output_retain_var = tk.StringVar()
+        retain_combo = ttk.Combobox(param_frame, textvariable=self.output_retain_var, state="readonly", width=32)
+        retain_combo["values"] = (
+            "Best Result Only",
+            "Feasible Results Only",
+            "All Results",
+        )
+        retain_combo.current(2)
+        retain_combo.grid(row=4, column=1, columnspan=4, sticky=tk.W, padx=2, pady=(4, 0))
+
+        # Stress modu
+        ttk.Label(param_frame, text="Stress Mode:").grid(row=5, column=0, sticky=tk.W, padx=2, pady=(4, 0))
+        self.stress_mode_var = tk.StringVar()
+        stress_combo = ttk.Combobox(param_frame, textvariable=self.stress_mode_var, state="readonly", width=32)
+        stress_combo["values"] = (
+            "Element Based",
+            "Average Stress",
+        )
+        stress_combo.current(0)
+        stress_combo.grid(row=5, column=1, columnspan=4, sticky=tk.W, padx=2, pady=(4, 0))
+        stress_combo.bind("<<ComboboxSelected>>", self._on_stress_mode_changed)
+
+        # Sigma secimi (sadece average modda aktif)
+        ttk.Label(param_frame, text="Sigma:").grid(row=6, column=0, sticky=tk.W, padx=2, pady=(4, 0))
+        self.sigma_var = tk.IntVar(value=0)
+        self.sigma_frame = ttk.Frame(param_frame)
+        self.sigma_frame.grid(row=6, column=1, columnspan=4, sticky=tk.W, padx=2, pady=(4, 0))
+        self.sigma_avg_btn = ttk.Radiobutton(self.sigma_frame, text="Average", variable=self.sigma_var, value=0)
+        self.sigma_avg_btn.pack(side=tk.LEFT, padx=4)
+        self.sigma_1_btn = ttk.Radiobutton(self.sigma_frame, text="1 Sigma", variable=self.sigma_var, value=1)
+        self.sigma_1_btn.pack(side=tk.LEFT, padx=4)
+        self.sigma_2_btn = ttk.Radiobutton(self.sigma_frame, text="2 Sigma", variable=self.sigma_var, value=2)
+        self.sigma_2_btn.pack(side=tk.LEFT, padx=4)
+        # Baslangicta devre disi (element based modda sigma kullanilmaz)
+        self.sigma_avg_btn.configure(state=tk.DISABLED)
+        self.sigma_1_btn.configure(state=tk.DISABLED)
+        self.sigma_2_btn.configure(state=tk.DISABLED)
+
+        ttk.Label(param_frame, text="Conv. Patience:").grid(row=7, column=0, sticky=tk.W, padx=2, pady=(4, 0))
+        self.conv_patience_entry = ttk.Entry(param_frame, width=8)
+        self.conv_patience_entry.grid(row=7, column=1, padx=2, pady=(4, 0))
+        self.conv_patience_entry.insert(0, "50")
+        self.patience_hint_var = tk.StringVar(value="(Suggested: 50)")
+        ttk.Label(param_frame, textvariable=self.patience_hint_var).grid(row=7, column=2, sticky=tk.W, padx=2, pady=(4, 0))
+
+        self.use_surrogate_var = tk.BooleanVar(value=False)
+        self.use_surrogate_chk = ttk.Checkbutton(
+            param_frame, text="Use Surrogate (L-SHADE/PSO)",
+            variable=self.use_surrogate_var)
+        self.use_surrogate_chk.grid(row=7, column=3, columnspan=4, sticky=tk.W, padx=4, pady=(4, 0))
+
+        main_frame.columnconfigure(1, weight=1)
+
+        # Butonlar
+        row += 1
+        btn_frame = ttk.Frame(main_frame)
+        btn_frame.grid(row=row, column=0, columnspan=4, pady=6)
+
+        self.run_btn = ttk.Button(btn_frame, text="Start Optimization", command=self._on_run)
+        self.run_btn.pack(side=tk.LEFT, padx=6)
+
+        self.single_btn = ttk.Button(btn_frame, text="Single Run", command=self._on_single_run)
+        self.single_btn.pack(side=tk.LEFT, padx=6)
+
+        self.stop_btn = ttk.Button(btn_frame, text="Stop", command=self._on_stop, state=tk.DISABLED)
+        self.stop_btn.pack(side=tk.LEFT, padx=6)
+
+        # İlerleme
+        row += 1
+        self.progress = ttk.Progressbar(main_frame, mode="determinate")
+        self.progress.grid(row=row, column=0, columnspan=4, sticky=tk.EW, pady=(0, 4))
+
+        # Log
+        row += 1
+        ttk.Label(main_frame, text="Operation Log:").grid(row=row, column=0, sticky=tk.W)
+        row += 1
+        self.log_text = tk.Text(main_frame, height=12, state=tk.DISABLED, wrap=tk.WORD)
+        self.log_text.grid(row=row, column=0, columnspan=3, sticky=tk.NSEW)
+        main_frame.rowconfigure(row, weight=1)
+
+        scrollbar = ttk.Scrollbar(main_frame, orient=tk.VERTICAL, command=self.log_text.yview)
+        scrollbar.grid(row=row, column=3, sticky=tk.NS)
+        self.log_text.configure(yscrollcommand=scrollbar.set)
+
+        # Sağ panel: Grafik
+        right_frame = ttk.Frame(paned)
+        paned.add(right_frame, weight=2)
+
+        self.fig, (self.ax_mass, self.ax_disp) = plt.subplots(2, 1, figsize=(5, 5))
+        self.fig.tight_layout(pad=3.0)
+
+        self.ax_mass.set_title("Total Mass vs Iteration", fontsize=10)
+        self.ax_mass.set_xlabel("Iteration")
+        self.ax_mass.set_ylabel("Mass (kg)")
+        self.ax_mass.grid(True, alpha=0.3)
+
+        self.ax_disp.set_title("Max Displacement (Mag) vs Iteration", fontsize=10)
+        self.ax_disp.set_xlabel("Iteration")
+        self.ax_disp.set_ylabel("Max Disp (Mag)")
+        self.ax_disp.grid(True, alpha=0.3)
+
+        self.canvas = FigureCanvasTkAgg(self.fig, master=right_frame)
+        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        self.canvas.draw()
+
+    def _on_algo_changed(self, event=None):
+        algo = self.algo_var.get()
+        no_parallel = "SPSA" in algo or "Standalone" in algo
+        if no_parallel:
+            self.n_parallel_entry.configure(state=tk.DISABLED)
+            self.n_parallel_entry.delete(0, tk.END)
+            self.n_parallel_entry.insert(0, "1")
+        else:
+            self.n_parallel_entry.configure(state=tk.NORMAL)
+        self._update_iter_hints()
+
+    def _browse_bdf(self):
+        path = filedialog.askopenfilename(
+            title="Select BDF File",
+            filetypes=[("BDF Dosyaları", "*.bdf *.dat *.nas"), ("Tüm Dosyalar", "*.*")]
+        )
+        if not path:
+            return
+        self.bdf_entry.delete(0, tk.END)
+        self.bdf_entry.insert(0, path)
+        # PSHELL sayısını hızlıca say (tam parse gerekmez)
+        n = 0
+        try:
+            with open(path, "r", errors="ignore") as _f:
+                for _line in _f:
+                    if _line[:6].strip().upper() == "PSHELL":
+                        n += 1
+        except Exception:
+            pass
+        self._n_pshell = n
+        self._update_iter_hints()
+
+    def _update_iter_hints(self):
+        """Seçili algoritma ve PSHELL sayısına göre önerilen iter/patience hesaplar."""
+        algo = self.algo_var.get()
+        n = getattr(self, "_n_pshell", 0)
+
+        # (base, k, cap) — rec_iter = min(base + k*n, cap)
+        _params = {
+            "OC + sep-CMA-ES": (200, 1.0,  1000),
+            "OC Standalone":   ( 80, 0.5,   300),
+            "L-SHADE":         (150, 1.0,   600),
+            "PSO":             (150, 1.0,   600),
+            "SPSA":            (300, 2.0,  1500),
+            "Genetic":         ( 50, 0.5,   300),
+            "FD + SQP":        ( 20, 0.2,   100),
+        }
+        base, k, cap = 200, 1.0, 1000
+        for key, vals in _params.items():
+            if key in algo:
+                base, k, cap = vals
+                break
+
+        rec_iter = int(min(base + k * max(n, 0), cap))
+        rec_pat  = max(10, rec_iter // 10)
+
+        self.max_iter_entry.delete(0, tk.END)
+        self.max_iter_entry.insert(0, str(rec_iter))
+        hint_n = f", n={n}" if n > 0 else ""
+        self.max_iter_label_var.set(f"Max Iter (Suggested: {rec_iter}{hint_n}):")
+        self.conv_patience_entry.delete(0, tk.END)
+        self.conv_patience_entry.insert(0, str(rec_pat))
+        self.patience_hint_var.set(f"(Suggested: {rec_pat})")
+
+    def _on_stress_mode_changed(self, event=None):
+        """Stress modu degistiginde sigma butonlarini aktif/deaktif yap."""
+        if self.stress_mode_var.get() == "Average Stress":
+            self.sigma_avg_btn.configure(state=tk.NORMAL)
+            self.sigma_1_btn.configure(state=tk.NORMAL)
+            self.sigma_2_btn.configure(state=tk.NORMAL)
+        else:
+            self.sigma_avg_btn.configure(state=tk.DISABLED)
+            self.sigma_1_btn.configure(state=tk.DISABLED)
+            self.sigma_2_btn.configure(state=tk.DISABLED)
+
+    def _toggle_excel_thickness(self):
+        """Excel'den Thickness Range okuma modunu aç/kapat."""
+        excel_path = self.excel_entry.get().strip()
+        if not excel_path or not os.path.isfile(excel_path):
+            messagebox.showerror("Error", "Please select the Allowable Excel file first.")
+            return
+
+        if not self.use_excel_thickness:
+            try:
+                self.thickness_range_data = load_thickness_range_excel(excel_path)
+                if not self.thickness_range_data:
+                    messagebox.showerror("Error", "Thickness Range sheet is empty!")
+                    return
+                self.use_excel_thickness = True
+                self.min_t_entry.configure(state=tk.DISABLED)
+                self.max_t_entry.configure(state=tk.DISABLED)
+                self.step_entry.configure(state=tk.DISABLED)
+                self.excel_thickness_btn.configure(text="Revert to Manual T")
+                self._log(f"  Thickness range loaded for {len(self.thickness_range_data)} PIDs from Excel.")
+            except Exception as exc:
+                messagebox.showerror("Error", f"Cannot read Thickness Range: {exc}")
+        else:
+            self.use_excel_thickness = False
+            self.thickness_range_data = None
+            self.min_t_entry.configure(state=tk.NORMAL)
+            self.max_t_entry.configure(state=tk.NORMAL)
+            self.step_entry.configure(state=tk.NORMAL)
+            self.excel_thickness_btn.configure(text="Excel'den T Oku")
+            self._log("  Manuel thickness parametrelerine geri donuldu.")
+
+    def _update_plot(self, iterations, masses, displacements, max_disp_limit):
+        """Thread-safe grafik güncelleme."""
+        direction = self.disp_dir_var.get() if hasattr(self, "disp_dir_var") else "Mag"
+        disp_label = f"Max Disp ({direction})"
+
+        def _do_update():
+            self.ax_mass.clear()
+            self.ax_mass.set_title("Total Mass vs Iteration", fontsize=10)
+            self.ax_mass.set_xlabel("Iteration")
+            self.ax_mass.set_ylabel("Mass (kg)")
+            self.ax_mass.grid(True, alpha=0.3)
+            self.ax_mass.plot(iterations, masses, "b-o", markersize=4, label="Mass")
+            self.ax_mass.legend(fontsize=8)
+
+            self.ax_disp.clear()
+            self.ax_disp.set_title(f"{disp_label} vs Iteration", fontsize=10)
+            self.ax_disp.set_xlabel("Iteration")
+            self.ax_disp.set_ylabel(disp_label)
+            self.ax_disp.grid(True, alpha=0.3)
+            self.ax_disp.plot(iterations, displacements, "r-o", markersize=4, label=disp_label)
+            self.ax_disp.axhline(y=max_disp_limit, color="green", linestyle="--",
+                                 linewidth=1.5, label=f"Limit ({max_disp_limit})")
+            self.ax_disp.legend(fontsize=8)
+
+            self.fig.tight_layout(pad=3.0)
+            self.canvas.draw()
+        self.root.after(0, _do_update)
+
+    def _log(self, message):
+        if getattr(self, '_log_file', None) is not None:
+            try:
+                self._log_file.write(message + "\n")
+                self._log_file.flush()
+            except Exception:
+                pass
+        def _append():
+            self.log_text.configure(state=tk.NORMAL)
+            self.log_text.insert(tk.END, message + "\n")
+            self.log_text.see(tk.END)
+            self.log_text.configure(state=tk.DISABLED)
+        self.root.after(0, _append)
+
+    def _set_progress(self, value):
+        self.root.after(0, lambda v=value: self.progress.configure(value=v))
+
+    def _validate_common(self):
+        bdf_path = self.bdf_entry.get().strip()
+        nastran_exe = self.nastran_entry.get().strip()
+        output_dir = self.output_entry.get().strip()
+
+        if not bdf_path or not os.path.isfile(bdf_path):
+            messagebox.showerror("Error", "Please select a valid BDF file.")
+            return None
+        if not nastran_exe or not os.path.isfile(nastran_exe):
+            messagebox.showerror("Error", "Please select a valid NX Nastran executable.")
+            return None
+        if not output_dir:
+            messagebox.showerror("Error", "Please select an output folder.")
+            return None
+        os.makedirs(output_dir, exist_ok=True)
+        return bdf_path, nastran_exe, output_dir
+
+    def _disable_buttons(self):
+        self._stop_event.clear()
+        self.run_btn.configure(state=tk.DISABLED)
+        self.single_btn.configure(state=tk.DISABLED)
+        self.stop_btn.configure(state=tk.NORMAL)
+
+    def _finish(self):
+        self.progress.stop()
+        self.progress.configure(mode="determinate", value=0)
+        self.run_btn.configure(state=tk.NORMAL)
+        self.single_btn.configure(state=tk.NORMAL)
+        self.stop_btn.configure(state=tk.DISABLED)
+
+    def _on_stop(self):
+        self._stop_event.set()
+        self.stop_btn.configure(state=tk.DISABLED)
+        self._log("\n⚠  Durdurma isteği alındı — mevcut Nastran çalışması bitince durulacak...")
+
+    def _on_single_run(self):
+        vals = self._validate_common()
+        if not vals:
+            return
+        bdf_path, nastran_exe, output_dir = vals
+        disp_direction = self.disp_dir_var.get()
+        self._disable_buttons()
+        self.progress.configure(mode="indeterminate")
+        self.progress.start(10)
+        threading.Thread(
+            target=self._single_worker,
+            args=(bdf_path, nastran_exe, output_dir, disp_direction),
+            daemon=True
+        ).start()
+
+    def _single_worker(self, bdf_path, nastran_exe, output_dir, disp_direction="Mag"):
+        try:
+            self._log("=" * 50)
+            self._log("TEK ÇÖZÜM MODU")
+            self._log(f"  Displacement Yönü: {disp_direction}")
+            self._log("=" * 50)
+
+            op2_path = run_nastran(nastran_exe, bdf_path, output_dir, self._log)
+            op2_model = _read_op2_with_retry(op2_path, self._log)
+            extract_results_csv(op2_model, output_dir, "result", self._log)
+
+            max_disp = get_max_absolute_displacement(op2_model, direction=disp_direction)
+            max_vm = max(get_von_mises_stresses(op2_model).values()) if get_von_mises_stresses(op2_model) else 0.0
+
+            del op2_model
+            cleanup_nastran_outputs(output_dir, self._log)
+
+            # BDF'den mass bilgisi
+            self._log("\nBDF okunuyor (mass hesabı)...")
+            pids, pid_mid_map, mid_density_map, _, pid_area_map, _, _ = read_bdf_model(bdf_path)
+            # Mevcut kalınlıkları oku
+            bdf_model = BDF(debug=False)
+            bdf_model.read_bdf(bdf_path, xref=False)
+            current_t = {}
+            for pid, prop in bdf_model.properties.items():
+                if prop.type == "PSHELL":
+                    current_t[pid] = prop.t
+            total_mass, _ = compute_real_mass(current_t, pid_mid_map, mid_density_map, pid_area_map)
+
+            log_mass_summary(total_mass, max_disp, 0, max_vm, True, self._log, disp_direction=disp_direction)
+
+            self._log("İŞLEM TAMAMLANDI!")
+            self.root.after(0, lambda: messagebox.showinfo("Success", "Results written as CSV!"))
+        except Exception as exc:
+            error_msg = str(exc)
+            self._log(f"\nHATA: {error_msg}")
+            self.root.after(0, lambda msg=error_msg: messagebox.showerror("Error", msg))
+        finally:
+            self.root.after(0, self._finish)
+
+
+    def _on_run(self):
+        vals = self._validate_common()
+        if not vals:
+            return
+        bdf_path, nastran_exe, output_dir = vals
+
+        excel_path = self.excel_entry.get().strip()
+        if not excel_path or not os.path.isfile(excel_path):
+            messagebox.showerror("Error", "Please select the stress allowable Excel file.")
+            return
+
+        thickness_range_data = None
+        if self.use_excel_thickness and self.thickness_range_data:
+            thickness_range_data = self.thickness_range_data
+            # Excel modunda dummy değerler (kullanılmayacak, per-PID'den alınacak)
+            min_t = 0.0
+            max_t = 1.0
+            step = 0.1
+        else:
+            try:
+                min_t = float(self.min_t_entry.get().strip())
+                max_t = float(self.max_t_entry.get().strip())
+                step = float(self.step_entry.get().strip())
+            except ValueError:
+                messagebox.showerror("Error", "Parameter values must be numeric.")
+                return
+            if min_t >= max_t or step <= 0:
+                messagebox.showerror("Error", "Min < Max and Step > 0 required.")
+                return
+
+        try:
+            max_disp_limit = float(self.max_disp_entry.get().strip())
+            max_iter = int(self.max_iter_entry.get().strip())
+            n_parallel = int(self.n_parallel_entry.get().strip())
+            if n_parallel < 1:
+                n_parallel = 1
+            memory_mb = int(self.memory_entry.get().strip())
+            if memory_mb < 0:
+                memory_mb = 0
+        except ValueError:
+            messagebox.showerror("Error", "Parameter values must be numeric.")
+            return
+
+        algo_name = self.algo_var.get()
+
+        retain_text = self.output_retain_var.get()
+        if "Optimum" in retain_text:
+            retain_mode = "optimum"
+        elif "Kriterleri" in retain_text:
+            retain_mode = "feasible"
+        else:
+            retain_mode = "all"
+
+        stress_mode = self.stress_mode_var.get()
+        sigma_count = self.sigma_var.get() if stress_mode == "Average Stress" else 0
+
+        scratch_dir = self.scratch_entry.get().strip() or None
+        disp_direction = self.disp_dir_var.get()
+
+        try:
+            conv_patience = int(self.conv_patience_entry.get().strip())
+            if conv_patience < 1:
+                conv_patience = 30
+        except (ValueError, AttributeError):
+            conv_patience = 30
+
+        use_surrogate = bool(self.use_surrogate_var.get())
+
+        self._disable_buttons()
+        self.progress.configure(mode="determinate", value=0)
+
+        threading.Thread(
+            target=self._opt_worker,
+            args=(bdf_path, nastran_exe, output_dir, excel_path,
+                  min_t, max_t, step, max_disp_limit, max_iter, algo_name, n_parallel, memory_mb,
+                  retain_mode, thickness_range_data, stress_mode, sigma_count, scratch_dir,
+                  disp_direction, conv_patience, use_surrogate),
+            daemon=True,
+        ).start()
+
+    def _opt_worker(self, bdf_path, nastran_exe, output_dir, excel_path,
+                    min_t, max_t, step, max_disp_limit, max_iter, algo_name, n_parallel, memory_mb,
+                    retain_mode="all", thickness_range_data=None,
+                    stress_mode="Element Based", sigma_count=0, scratch_dir=None,
+                    disp_direction="Mag", conv_patience=30, use_surrogate=False):
+        import datetime as _dt
+        _iter_file = None
+        self._log_file = None
+        try:
+            global _ref_op2_size
+            _ref_op2_size = 0   # her optimizasyon başında kalibrasyonu sıfırla
+
+            # Log dosyası aç
+            _ts = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+            try:
+                self._log_file = open(
+                    os.path.join(output_dir, f"optimization_log_{_ts}.txt"),
+                    "w", encoding="utf-8"
+                )
+            except Exception:
+                self._log_file = None
+
+            # İterasyon sonuç dosyası aç
+            try:
+                _iter_file = open(
+                    os.path.join(output_dir, f"iteration_results_{_ts}.txt"),
+                    "w", encoding="utf-8"
+                )
+                _iter_file.write(f"{'No':>6}  {'Etiket':<22}  {'Kutle_kg':>12}  {'MaxDisp':>12}  {'MaxVonMises':>12}  Stress\n")
+                _iter_file.write("-" * 80 + "\n")
+                _iter_file.flush()
+            except Exception:
+                _iter_file = None
+
+            self._log("=" * 60)
+            self._log(f"OPTİMİZASYON: {algo_name}")
+            if thickness_range_data:
+                self._log(f"  Thickness: Excel'den PID bazli (Thickness Range)")
+            else:
+                self._log(f"  Min: {min_t}  Max: {max_t}  Step: {step}")
+            self._log(f"  Max Disp: {max_disp_limit} ({disp_direction})  Max Iter: {max_iter}  Paralel: {n_parallel}  Memory: {memory_mb}mb" if memory_mb > 0 else f"  Max Disp: {max_disp_limit} ({disp_direction})  Max Iter: {max_iter}  Paralel: {n_parallel}")
+            if scratch_dir:
+                self._log(f"  Scratch: {scratch_dir}")
+            self._log("=" * 60)
+
+            # BDF'den PSHELL, malzeme ve alan bilgisi oku
+            self._log("\nBDF modeli okunuyor...")
+            pids, pid_mid_map, mid_density_map, mid_E_map, pid_area_map, eid_pid_map, eid_area_map = read_bdf_model(bdf_path)
+            if not pids:
+                raise ValueError("BDF dosyasında PSHELL kartı bulunamadı!")
+            self._log(f"  {len(pids)} PSHELL bulundu")
+            self._log(f"  {len(mid_density_map)} malzeme density yüklendi")
+            total_area = sum(pid_area_map.values())
+            self._log(f"  Toplam eleman alanı: {total_area:.4f}")
+
+            # Excel'den PID bazli thickness range varsa, per-PID bounds olustur
+            if thickness_range_data:
+                pid_bounds = {}
+                for pid in pids:
+                    if pid in thickness_range_data:
+                        pid_bounds[pid] = thickness_range_data[pid]
+                    else:
+                        pid_bounds[pid] = (min_t, max_t, step)
+                        self._log(f"  UYARI: PID {pid} Excel'de yok, varsayilan degerler kullanilacak.")
+                # Global min/max/step algoritmaya geçmek için ortalamaları al
+                all_mins = [pid_bounds[p][0] for p in pids]
+                all_maxs = [pid_bounds[p][1] for p in pids]
+                all_steps = [pid_bounds[p][2] for p in pids]
+                min_t = min(all_mins)
+                max_t = max(all_maxs)
+                step = min(all_steps)
+            else:
+                pid_bounds = {pid: (min_t, max_t, step) for pid in pids}
+
+            # Stress moduna gore allowable yukle
+            if stress_mode == "Average Stress":
+                sigma_label = "Average (sigma yok)" if sigma_count == 0 else f"{sigma_count} sigma"
+                self._log(f"  Stress modu: {stress_mode} ({sigma_label})")
+            else:
+                self._log(f"  Stress modu: {stress_mode}")
+            if stress_mode == "Average Stress":
+                prop_allowable_map = load_allowable_excel(excel_path, sheet_name="Stress Allowable(Prop Based)")
+                self._log(f"  {len(prop_allowable_map)} property allowable yuklendi (Prop Based).")
+                # Element-based allowable da gerekli (algoritmalar icin)
+                allowable_map = prop_allowable_map
+            else:
+                allowable_map = load_allowable_excel(excel_path, sheet_name="Stress Allowable(Element Based)")
+                self._log(f"  {len(allowable_map)} element allowable yuklendi (Element Based).")
+                prop_allowable_map = None
+
+            # Tracker oluştur
+            tracker = IterationTracker(
+                pid_mid_map, mid_density_map, pid_area_map,
+                max_disp_limit, self._update_plot,
+                iter_file=_iter_file
+            )
+
+            # Algoritma çalıştır
+            algo_kwargs = dict(
+                bdf_path=bdf_path, nastran_exe=nastran_exe, output_dir=output_dir,
+                pids=pids, allowable_map=allowable_map,
+                min_t=min_t, max_t=max_t, step=step,
+                max_disp_limit=max_disp_limit, max_iter=max_iter,
+                log_callback=self._log, progress_callback=self._set_progress,
+                tracker=tracker, n_parallel=n_parallel, memory_mb=memory_mb,
+                pid_bounds=pid_bounds,
+                stress_mode=stress_mode, sigma_count=sigma_count,
+                eid_pid_map=eid_pid_map, eid_area_map=eid_area_map,
+                scratch_dir=scratch_dir, disp_direction=disp_direction,
+                stop_event=self._stop_event,
+                conv_patience=conv_patience,
+            )
+
+            _mass_kwargs = dict(pid_mid_map=pid_mid_map,
+                                mid_density_map=mid_density_map,
+                                pid_area_map=pid_area_map)
+
+            if "FD" in algo_name or "SQP" in algo_name:
+                result_t, final_disp, final_stress = optimize_fd_sqp(**algo_kwargs)
+
+            elif "Standalone" in algo_name:
+                algo_kwargs.update(_mass_kwargs, mid_E_map=mid_E_map)
+                result_t, final_disp, final_stress = optimize_oc(**algo_kwargs)
+
+            elif "L-SHADE" in algo_name or "Adaptive" in algo_name:
+                algo_kwargs.update(_mass_kwargs, use_surrogate=use_surrogate)
+                result_t, final_disp, final_stress = optimize_lshade(**algo_kwargs)
+
+            elif "PSO" in algo_name or "Particle" in algo_name:
+                algo_kwargs.update(_mass_kwargs, use_surrogate=use_surrogate)
+                result_t, final_disp, final_stress = optimize_pso(**algo_kwargs)
+
+            elif "SPSA" in algo_name or "Stochastic Gradient" in algo_name:
+                algo_kwargs.update(_mass_kwargs)
+                result_t, final_disp, final_stress = optimize_spsa(**algo_kwargs)
+
+            elif "OC" in algo_name or "CMA" in algo_name:
+                algo_kwargs.update(_mass_kwargs, mid_E_map=mid_E_map)
+                result_t, final_disp, final_stress = optimize_oc_sepcmaes(**algo_kwargs)
+
+            else:  # GA
+                algo_kwargs.update(_mass_kwargs)
+                result_t, final_disp, final_stress = optimize_genetic(**algo_kwargs)
+
+            # Tüm iterasyonları tara: displacement + stress kısıtını sağlayan en hafif çözüm
+            if stress_mode == "Average Stress":
+                _avg_tmp = compute_average_stress_per_pid(
+                    final_stress, eid_pid_map, eid_area_map, sigma_count)
+                _final_ok, _, _ = check_stress_constraints_average(_avg_tmp, prop_allowable_map)
+            else:
+                _final_ok, _, _ = check_stress_constraints(final_stress, allowable_map)
+            current_is_feasible = (final_disp <= max_disp_limit and _final_ok)
+
+            best_feasible_t, best_feasible_mass = tracker.get_best_feasible(max_disp_limit)
+            if best_feasible_t is not None:
+                current_final_mass, _ = compute_real_mass(
+                    result_t, tracker.pid_mid_map, tracker.mid_density_map, tracker.pid_area_map
+                )
+                should_override = (not current_is_feasible) or (best_feasible_mass < current_final_mass)
+                if should_override:
+                    reason = "algoritma sonucu kısıtları sağlamıyor" if not current_is_feasible else "daha hafif uygun çözüm bulundu"
+                    self._log(f"\n  En iyi uygun çözüme geçiliyor ({reason}):")
+                    self._log(f"    Algoritma sonucu: {current_final_mass:.6f} kg  feasible={current_is_feasible}")
+                    self._log(f"    En hafif feasible: {best_feasible_mass:.6f} kg")
+                    self._log(f"  Yeniden çözülüyor...")
+                    best_dir = os.path.join(output_dir, "best_feasible_result")
+                    best_disp2, best_stress2 = solve_and_evaluate(
+                        nastran_exe, bdf_path, best_feasible_t, best_dir, self._log,
+                        memory_mb=memory_mb, scratch_dir=scratch_dir,
+                        disp_direction=disp_direction
+                    )
+                    result_t = best_feasible_t
+                    final_disp = best_disp2
+                    final_stress = best_stress2
+            elif not current_is_feasible:
+                self._log("\n  UYARI: Hiç uygun (feasible) çözüm bulunamadı. "
+                          "En iyi bulunan sonuç (kısıt ihlali var) döndürülüyor.")
+
+            # Sonuç raporu
+            self._log(f"\n{'='*60}")
+            self._log("OPTİMİZASYON SONUÇLARI")
+
+            if stress_mode == "Average Stress":
+                avg_stress_data = compute_average_stress_per_pid(
+                    final_stress, eid_pid_map, eid_area_map, sigma_count
+                )
+                stress_ok, failed, max_vm = check_stress_constraints_average(
+                    avg_stress_data, prop_allowable_map
+                )
+                # Average stress detaylarini logla
+                sigma_label = "Average (sigma yok)" if sigma_count == 0 else f"{sigma_count} sigma"
+                self._log(f"\n  Average Stress Sonuclari ({sigma_label}):")
+                self._log(f"  {'PID':>6}  {'Avg':>10}  {'Sigma':>10}  {'Avg+nS':>10}  {'MaxStr':>10}  {'Allow':>10}  {'Durum':>6}")
+                for pid in sorted(avg_stress_data.keys()):
+                    avg, sig, eff, mx = avg_stress_data[pid]
+                    allow = prop_allowable_map.get(pid, 0)
+                    status = "OK" if eff <= allow else "FAIL"
+                    self._log(f"  {pid:>6}  {avg:>10.2f}  {sig:>10.2f}  {eff:>10.2f}  {mx:>10.2f}  {allow:>10.2f}  {status:>6}")
+            else:
+                stress_ok, failed, max_vm = check_stress_constraints(final_stress, allowable_map)
+
+            total_mass, pid_mass = compute_real_mass(
+                result_t, pid_mid_map, mid_density_map, pid_area_map
+            )
+            log_mass_summary(total_mass, final_disp, max_disp_limit, max_vm, stress_ok, self._log,
+                             disp_direction=disp_direction)
+
+            # Kalınlık + mass CSV
+            t_rows = []
+            for pid in sorted(result_t.keys()):
+                t_rows.append({
+                    "PID": pid,
+                    "Thickness": result_t[pid],
+                    "Area": pid_area_map.get(pid, 0),
+                    "Mass": pid_mass.get(pid, 0),
+                })
+            t_df = pd.DataFrame(t_rows)
+            t_csv = os.path.join(output_dir, "optimized_thicknesses.csv")
+            t_df.to_csv(t_csv, index=False)
+            self._log(f"  Kalınlık dağılımı: {t_csv}")
+
+            # Optimize edilmiş BDF export
+            try:
+                bdf_name = os.path.splitext(os.path.basename(bdf_path))[0]
+                opt_bdf_path = os.path.join(output_dir, f"optimized_{bdf_name}.bdf")
+                modify_pshell_thicknesses(bdf_path, opt_bdf_path, result_t, self._log)
+                self._log(f"  Optimize BDF: {opt_bdf_path}")
+            except Exception as _bdf_exc:
+                self._log(f"  [Uyarı] BDF export başarısız: {_bdf_exc}")
+
+            # İterasyon geçmişi CSV
+            hist_df = pd.DataFrame({
+                "Iteration": tracker.iterations,
+                "Mass_kg": tracker.masses,
+                f"MaxDisplacement_{disp_direction}": tracker.displacements,
+                "MaxVonMises": tracker.stresses,
+            })
+            hist_csv = os.path.join(output_dir, "iteration_history.csv")
+            hist_df.to_csv(hist_csv, index=False)
+
+            # Pareto front CSV
+            try:
+                pareto = tracker.get_pareto_front()
+                if pareto:
+                    pareto_df = pd.DataFrame([
+                        {"Mass_kg": p["mass"], f"MaxDisp_{disp_direction}": p["max_disp"],
+                         "MaxVonMises": p["max_vm"], "Stress_OK": p["stress_ok"]}
+                        for p in pareto
+                    ])
+                    pareto_csv = os.path.join(output_dir, "pareto_front.csv")
+                    pareto_df.to_csv(pareto_csv, index=False)
+                    self._log(f"  Pareto front ({len(pareto)} nokta): {pareto_csv}")
+                    # Pareto plot
+                    try:
+                        import matplotlib.pyplot as _plt
+                        _pfig, _pax = _plt.subplots(figsize=(5, 4))
+                        _pax.scatter([p["mass"] for p in pareto],
+                                     [p[f"max_disp"] for p in pareto], c="blue", zorder=3)
+                        _pax.set_xlabel("Mass (kg)")
+                        _pax.set_ylabel(f"Max Disp ({disp_direction})")
+                        _pax.set_title("Pareto Front")
+                        _pax.grid(True, alpha=0.3)
+                        _pfig.tight_layout()
+                        _pfig.savefig(os.path.join(output_dir, "pareto_front.png"), dpi=150)
+                        _plt.close(_pfig)
+                    except Exception:
+                        pass
+            except Exception as _pf_exc:
+                self._log(f"  [Uyarı] Pareto front hesaplanamadı: {_pf_exc}")
+
+            # Grafiği kaydet
+            self.fig.savefig(os.path.join(output_dir, "optimization_plot.png"), dpi=150)
+
+            # Çıktı dosyalarını saklama moduna göre temizle
+            cleanup_iteration_outputs(
+                output_dir, retain_mode, tracker, max_disp_limit,
+                allowable_map, self._log
+            )
+
+            self._log("\nİŞLEM TAMAMLANDI!")
+            self.root.after(0, lambda: messagebox.showinfo(
+                "Optimization Complete",
+                f"Total Mass: {total_mass:.4f} kg\n"
+                f"Max Disp ({disp_direction}): {final_disp:.4f}\n"
+                f"Max VM: {max_vm:.2f}\n\n"
+                f"Detaylar: {t_csv}"
+            ))
+
+        except Exception as exc:
+            error_msg = str(exc)
+            self._log(f"\nHATA: {error_msg}")
+            self.root.after(0, lambda msg=error_msg: messagebox.showerror("Error", msg))
+        finally:
+            for _f in (_iter_file, self._log_file):
+                if _f is not None:
+                    try:
+                        _f.close()
+                    except Exception:
+                        pass
+            self._log_file = None
+            if scratch_dir:
+                try:
+                    cleanup_scratch_dir(scratch_dir, self._log)
+                except Exception:
+                    pass
+            self.root.after(0, self._finish)
+
+
+def main():
+    root = tk.Tk()
+    NastranToolApp(root)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
