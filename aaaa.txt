@@ -2792,7 +2792,6 @@ class NastranToolApp:
             "OC Standalone (Seri, Hızlı)",
             "L-SHADE (Adaptive DE)",
             "PSO (Particle Swarm)",
-            "SPSA (Stochastic Gradient)",
             "Genetic Algorithm (GA)",
             "FD + SQP (Forward Difference)",
         )
