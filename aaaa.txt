@@ -2665,7 +2665,7 @@ def cleanup_iteration_outputs(output_dir, retain_mode, tracker, max_disp_limit,
 class NastranToolApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("Eray-Tool | NX Nastran Thickness Optimizasyon Aracı")
+        self.root.title("Thickness Optimization Tool | NX Nastran")
         self.root.geometry("1100x750")
         self.root.resizable(True, True)
         self.use_excel_thickness = False
@@ -2686,43 +2686,43 @@ class NastranToolApp:
         main_frame.pack(fill=tk.BOTH, expand=True)
 
         row = 0
-        ttk.Label(main_frame, text="BDF Dosyası:").grid(row=row, column=0, sticky=tk.W, pady=2)
+        ttk.Label(main_frame, text="BDF File:").grid(row=row, column=0, sticky=tk.W, pady=2)
         self.bdf_entry = ttk.Entry(main_frame, width=45)
         self.bdf_entry.grid(row=row, column=1, columnspan=2, sticky=tk.EW, padx=4)
-        ttk.Button(main_frame, text="Seç...", command=self._browse_bdf).grid(row=row, column=3)
+        ttk.Button(main_frame, text="Browse...", command=self._browse_bdf).grid(row=row, column=3)
 
         row += 1
         ttk.Label(main_frame, text="NX Nastran:").grid(row=row, column=0, sticky=tk.W, pady=2)
         self.nastran_entry = ttk.Entry(main_frame, width=45)
         self.nastran_entry.grid(row=row, column=1, columnspan=2, sticky=tk.EW, padx=4)
-        ttk.Button(main_frame, text="Seç...", command=lambda: select_file(
-            self.nastran_entry, "NX Nastran Seçiniz",
-            [("Çalıştırılabilir", "*.exe *.bat"), ("Tüm Dosyalar", "*.*")]
+        ttk.Button(main_frame, text="Browse...", command=lambda: select_file(
+            self.nastran_entry, "Select NX Nastran",
+            [("Executable", "*.exe *.bat"), ("All Files", "*.*")]
         )).grid(row=row, column=3)
 
         row += 1
-        ttk.Label(main_frame, text="Çıktı Klasörü:").grid(row=row, column=0, sticky=tk.W, pady=2)
+        ttk.Label(main_frame, text="Output Folder:").grid(row=row, column=0, sticky=tk.W, pady=2)
         self.output_entry = ttk.Entry(main_frame, width=45)
         self.output_entry.grid(row=row, column=1, columnspan=2, sticky=tk.EW, padx=4)
-        ttk.Button(main_frame, text="Seç...", command=lambda: select_directory(
-            self.output_entry, "Çıktı Klasörü Seçiniz"
+        ttk.Button(main_frame, text="Browse...", command=lambda: select_directory(
+            self.output_entry, "Select Output Folder"
         )).grid(row=row, column=3)
 
         row += 1
-        ttk.Label(main_frame, text="Scratch Klasörü:").grid(row=row, column=0, sticky=tk.W, pady=2)
+        ttk.Label(main_frame, text="Scratch Folder:").grid(row=row, column=0, sticky=tk.W, pady=2)
         self.scratch_entry = ttk.Entry(main_frame, width=45)
         self.scratch_entry.grid(row=row, column=1, columnspan=2, sticky=tk.EW, padx=4)
-        ttk.Button(main_frame, text="Seç...", command=lambda: select_directory(
-            self.scratch_entry, "Scratch Klasörü Seçiniz"
+        ttk.Button(main_frame, text="Browse...", command=lambda: select_directory(
+            self.scratch_entry, "Select Scratch Folder"
         )).grid(row=row, column=3)
 
         row += 1
         ttk.Label(main_frame, text="Allowable Excel:").grid(row=row, column=0, sticky=tk.W, pady=2)
         self.excel_entry = ttk.Entry(main_frame, width=45)
         self.excel_entry.grid(row=row, column=1, columnspan=2, sticky=tk.EW, padx=4)
-        ttk.Button(main_frame, text="Seç...", command=lambda: select_file(
-            self.excel_entry, "Stress Allowable Excel Seçiniz",
-            [("Excel Dosyaları", "*.xlsx *.xls"), ("Tüm Dosyalar", "*.*")]
+        ttk.Button(main_frame, text="Browse...", command=lambda: select_file(
+            self.excel_entry, "Select Stress Allowable Excel",
+            [("Excel Files", "*.xlsx *.xls"), ("All Files", "*.*")]
         )).grid(row=row, column=3)
 
         row += 1
@@ -2732,7 +2732,7 @@ class NastranToolApp:
 
         # Parametreler
         row += 1
-        param_frame = ttk.LabelFrame(main_frame, text="Optimizasyon Parametreleri", padding=6)
+        param_frame = ttk.LabelFrame(main_frame, text="Optimization Parameters", padding=6)
         param_frame.grid(row=row, column=0, columnspan=4, sticky=tk.EW, pady=2)
 
         ttk.Label(param_frame, text="Min T:").grid(row=0, column=0, sticky=tk.W, padx=2)
@@ -2751,7 +2751,7 @@ class NastranToolApp:
         self.step_entry.insert(0, "0.1")
 
         self.excel_thickness_btn = ttk.Button(
-            param_frame, text="Excel'den T Oku",
+            param_frame, text="Load T from Excel",
             command=self._toggle_excel_thickness
         )
         self.excel_thickness_btn.grid(row=0, column=6, padx=4)
@@ -2761,13 +2761,13 @@ class NastranToolApp:
         self.max_disp_entry.grid(row=1, column=1, padx=2, pady=(4, 0))
         self.max_disp_entry.insert(0, "10.0")
 
-        ttk.Label(param_frame, text="Yön:").grid(row=1, column=2, sticky=tk.W, padx=(8, 2), pady=(4, 0))
+        ttk.Label(param_frame, text="Direction:").grid(row=1, column=2, sticky=tk.W, padx=(8, 2), pady=(4, 0))
         self.disp_dir_var = tk.StringVar(value="Mag")
         disp_dir_combo = ttk.Combobox(param_frame, textvariable=self.disp_dir_var,
                                       values=["Mag", "X", "Y", "Z"], state="readonly", width=5)
         disp_dir_combo.grid(row=1, column=3, padx=2, pady=(4, 0), sticky=tk.W)
 
-        self.max_iter_label_var = tk.StringVar(value="Max Iter (Önerilen: 500):")
+        self.max_iter_label_var = tk.StringVar(value="Max Iter (Suggested: 500):")
         ttk.Label(param_frame, textvariable=self.max_iter_label_var).grid(row=1, column=4, sticky=tk.W, padx=2, pady=(4, 0))
         self.max_iter_entry = ttk.Entry(param_frame, width=8)
         self.max_iter_entry.grid(row=1, column=5, padx=2, pady=(4, 0))
@@ -2777,14 +2777,14 @@ class NastranToolApp:
         self.memory_entry = ttk.Entry(param_frame, width=8)
         self.memory_entry.grid(row=2, column=1, padx=2, pady=(4, 0))
         self.memory_entry.insert(0, "0")
-        ttk.Label(param_frame, text="(0 = varsayılan)").grid(row=2, column=2, sticky=tk.W, padx=2, pady=(4, 0))
+        ttk.Label(param_frame, text="(0 = default)").grid(row=2, column=2, sticky=tk.W, padx=2, pady=(4, 0))
 
         ttk.Label(param_frame, text="Paralel Run:").grid(row=2, column=3, sticky=tk.W, padx=(8, 2), pady=(4, 0))
         self.n_parallel_entry = ttk.Entry(param_frame, width=8)
         self.n_parallel_entry.grid(row=2, column=4, padx=2, pady=(4, 0))
         self.n_parallel_entry.insert(0, "1")
 
-        ttk.Label(param_frame, text="Algoritma:").grid(row=3, column=0, sticky=tk.W, padx=2, pady=(4, 0))
+        ttk.Label(param_frame, text="Algorithm:").grid(row=3, column=0, sticky=tk.W, padx=2, pady=(4, 0))
         self.algo_var = tk.StringVar()
         algo_combo = ttk.Combobox(param_frame, textvariable=self.algo_var, state="readonly", width=32)
         algo_combo["values"] = (
@@ -2799,19 +2799,19 @@ class NastranToolApp:
         algo_combo.grid(row=3, column=1, columnspan=4, sticky=tk.W, padx=2, pady=(4, 0))
         algo_combo.bind("<<ComboboxSelected>>", self._on_algo_changed)
 
-        ttk.Label(param_frame, text="Sonuç Saklama:").grid(row=4, column=0, sticky=tk.W, padx=2, pady=(4, 0))
+        ttk.Label(param_frame, text="Save Results:").grid(row=4, column=0, sticky=tk.W, padx=2, pady=(4, 0))
         self.output_retain_var = tk.StringVar()
         retain_combo = ttk.Combobox(param_frame, textvariable=self.output_retain_var, state="readonly", width=32)
         retain_combo["values"] = (
-            "Sadece En Optimum Sonuc",
-            "Kriterleri Saglayan Sonuclar",
-            "Butun Sonuclar",
+            "Best Result Only",
+            "Feasible Results Only",
+            "All Results",
         )
         retain_combo.current(2)
         retain_combo.grid(row=4, column=1, columnspan=4, sticky=tk.W, padx=2, pady=(4, 0))
 
         # Stress modu
-        ttk.Label(param_frame, text="Stress Modu:").grid(row=5, column=0, sticky=tk.W, padx=2, pady=(4, 0))
+        ttk.Label(param_frame, text="Stress Mode:").grid(row=5, column=0, sticky=tk.W, padx=2, pady=(4, 0))
         self.stress_mode_var = tk.StringVar()
         stress_combo = ttk.Combobox(param_frame, textvariable=self.stress_mode_var, state="readonly", width=32)
         stress_combo["values"] = (
@@ -2838,16 +2838,16 @@ class NastranToolApp:
         self.sigma_1_btn.configure(state=tk.DISABLED)
         self.sigma_2_btn.configure(state=tk.DISABLED)
 
-        ttk.Label(param_frame, text="Yakınsama Sabrı:").grid(row=7, column=0, sticky=tk.W, padx=2, pady=(4, 0))
+        ttk.Label(param_frame, text="Conv. Patience:").grid(row=7, column=0, sticky=tk.W, padx=2, pady=(4, 0))
         self.conv_patience_entry = ttk.Entry(param_frame, width=8)
         self.conv_patience_entry.grid(row=7, column=1, padx=2, pady=(4, 0))
         self.conv_patience_entry.insert(0, "50")
-        self.patience_hint_var = tk.StringVar(value="(Önerilen: 50)")
+        self.patience_hint_var = tk.StringVar(value="(Suggested: 50)")
         ttk.Label(param_frame, textvariable=self.patience_hint_var).grid(row=7, column=2, sticky=tk.W, padx=2, pady=(4, 0))
 
         self.use_surrogate_var = tk.BooleanVar(value=False)
         self.use_surrogate_chk = ttk.Checkbutton(
-            param_frame, text="Surrogate Kullan (L-SHADE/PSO)",
+            param_frame, text="Use Surrogate (L-SHADE/PSO)",
             variable=self.use_surrogate_var)
         self.use_surrogate_chk.grid(row=7, column=3, columnspan=4, sticky=tk.W, padx=4, pady=(4, 0))
 
@@ -2858,13 +2858,13 @@ class NastranToolApp:
         btn_frame = ttk.Frame(main_frame)
         btn_frame.grid(row=row, column=0, columnspan=4, pady=6)
 
-        self.run_btn = ttk.Button(btn_frame, text="Optimizasyonu Başlat", command=self._on_run)
+        self.run_btn = ttk.Button(btn_frame, text="Start Optimization", command=self._on_run)
         self.run_btn.pack(side=tk.LEFT, padx=6)
 
-        self.single_btn = ttk.Button(btn_frame, text="Tek Çözüm", command=self._on_single_run)
+        self.single_btn = ttk.Button(btn_frame, text="Single Run", command=self._on_single_run)
         self.single_btn.pack(side=tk.LEFT, padx=6)
 
-        self.stop_btn = ttk.Button(btn_frame, text="Durdur", command=self._on_stop, state=tk.DISABLED)
+        self.stop_btn = ttk.Button(btn_frame, text="Stop", command=self._on_stop, state=tk.DISABLED)
         self.stop_btn.pack(side=tk.LEFT, padx=6)
 
         # İlerleme
@@ -2874,7 +2874,7 @@ class NastranToolApp:
 
         # Log
         row += 1
-        ttk.Label(main_frame, text="İşlem Günlüğü:").grid(row=row, column=0, sticky=tk.W)
+        ttk.Label(main_frame, text="Operation Log:").grid(row=row, column=0, sticky=tk.W)
         row += 1
         self.log_text = tk.Text(main_frame, height=12, state=tk.DISABLED, wrap=tk.WORD)
         self.log_text.grid(row=row, column=0, columnspan=3, sticky=tk.NSEW)
@@ -2918,7 +2918,7 @@ class NastranToolApp:
 
     def _browse_bdf(self):
         path = filedialog.askopenfilename(
-            title="BDF Dosyası Seçiniz",
+            title="Select BDF File",
             filetypes=[("BDF Dosyaları", "*.bdf *.dat *.nas"), ("Tüm Dosyalar", "*.*")]
         )
         if not path:
@@ -2964,10 +2964,10 @@ class NastranToolApp:
         self.max_iter_entry.delete(0, tk.END)
         self.max_iter_entry.insert(0, str(rec_iter))
         hint_n = f", n={n}" if n > 0 else ""
-        self.max_iter_label_var.set(f"Max Iter (Önerilen: {rec_iter}{hint_n}):")
+        self.max_iter_label_var.set(f"Max Iter (Suggested: {rec_iter}{hint_n}):")
         self.conv_patience_entry.delete(0, tk.END)
         self.conv_patience_entry.insert(0, str(rec_pat))
-        self.patience_hint_var.set(f"(Önerilen: {rec_pat})")
+        self.patience_hint_var.set(f"(Suggested: {rec_pat})")
 
     def _on_stress_mode_changed(self, event=None):
         """Stress modu degistiginde sigma butonlarini aktif/deaktif yap."""
@@ -2984,23 +2984,23 @@ class NastranToolApp:
         """Excel'den Thickness Range okuma modunu aç/kapat."""
         excel_path = self.excel_entry.get().strip()
         if not excel_path or not os.path.isfile(excel_path):
-            messagebox.showerror("Hata", "Oncelikle Allowable Excel dosyasini seciniz.")
+            messagebox.showerror("Error", "Please select the Allowable Excel file first.")
             return
 
         if not self.use_excel_thickness:
             try:
                 self.thickness_range_data = load_thickness_range_excel(excel_path)
                 if not self.thickness_range_data:
-                    messagebox.showerror("Hata", "Thickness Range sayfasi bos!")
+                    messagebox.showerror("Error", "Thickness Range sheet is empty!")
                     return
                 self.use_excel_thickness = True
                 self.min_t_entry.configure(state=tk.DISABLED)
                 self.max_t_entry.configure(state=tk.DISABLED)
                 self.step_entry.configure(state=tk.DISABLED)
-                self.excel_thickness_btn.configure(text="Manuel T'ye Don")
-                self._log(f"  Excel'den {len(self.thickness_range_data)} PID icin thickness range yuklendi.")
+                self.excel_thickness_btn.configure(text="Revert to Manual T")
+                self._log(f"  Thickness range loaded for {len(self.thickness_range_data)} PIDs from Excel.")
             except Exception as exc:
-                messagebox.showerror("Hata", f"Thickness Range okunamadi: {exc}")
+                messagebox.showerror("Error", f"Cannot read Thickness Range: {exc}")
         else:
             self.use_excel_thickness = False
             self.thickness_range_data = None
@@ -3061,13 +3061,13 @@ class NastranToolApp:
         output_dir = self.output_entry.get().strip()
 
         if not bdf_path or not os.path.isfile(bdf_path):
-            messagebox.showerror("Hata", "Geçerli bir BDF dosyası seçiniz.")
+            messagebox.showerror("Error", "Please select a valid BDF file.")
             return None
         if not nastran_exe or not os.path.isfile(nastran_exe):
-            messagebox.showerror("Hata", "Geçerli bir NX Nastran dosyası seçiniz.")
+            messagebox.showerror("Error", "Please select a valid NX Nastran executable.")
             return None
         if not output_dir:
-            messagebox.showerror("Hata", "Çıktı klasörü seçiniz.")
+            messagebox.showerror("Error", "Please select an output folder.")
             return None
         os.makedirs(output_dir, exist_ok=True)
         return bdf_path, nastran_exe, output_dir
@@ -3137,11 +3137,11 @@ class NastranToolApp:
             log_mass_summary(total_mass, max_disp, 0, max_vm, True, self._log, disp_direction=disp_direction)
 
             self._log("İŞLEM TAMAMLANDI!")
-            self.root.after(0, lambda: messagebox.showinfo("Başarılı", "Sonuçlar CSV olarak yazıldı!"))
+            self.root.after(0, lambda: messagebox.showinfo("Success", "Results written as CSV!"))
         except Exception as exc:
             error_msg = str(exc)
             self._log(f"\nHATA: {error_msg}")
-            self.root.after(0, lambda msg=error_msg: messagebox.showerror("Hata", msg))
+            self.root.after(0, lambda msg=error_msg: messagebox.showerror("Error", msg))
         finally:
             self.root.after(0, self._finish)
 
@@ -3154,7 +3154,7 @@ class NastranToolApp:
 
         excel_path = self.excel_entry.get().strip()
         if not excel_path or not os.path.isfile(excel_path):
-            messagebox.showerror("Hata", "Stress allowable Excel dosyası seçiniz.")
+            messagebox.showerror("Error", "Please select the stress allowable Excel file.")
             return
 
         thickness_range_data = None
@@ -3170,10 +3170,10 @@ class NastranToolApp:
                 max_t = float(self.max_t_entry.get().strip())
                 step = float(self.step_entry.get().strip())
             except ValueError:
-                messagebox.showerror("Hata", "Parametre değerleri sayısal olmalıdır.")
+                messagebox.showerror("Error", "Parameter values must be numeric.")
                 return
             if min_t >= max_t or step <= 0:
-                messagebox.showerror("Hata", "Min < Max ve Step > 0 olmalıdır.")
+                messagebox.showerror("Error", "Min < Max and Step > 0 required.")
                 return
 
         try:
@@ -3186,7 +3186,7 @@ class NastranToolApp:
             if memory_mb < 0:
                 memory_mb = 0
         except ValueError:
-            messagebox.showerror("Hata", "Parametre değerleri sayısal olmalıdır.")
+            messagebox.showerror("Error", "Parameter values must be numeric.")
             return
 
         algo_name = self.algo_var.get()
@@ -3507,7 +3507,7 @@ class NastranToolApp:
 
             self._log("\nİŞLEM TAMAMLANDI!")
             self.root.after(0, lambda: messagebox.showinfo(
-                "Optimizasyon Tamamlandı",
+                "Optimization Complete",
                 f"Total Mass: {total_mass:.4f} kg\n"
                 f"Max Disp ({disp_direction}): {final_disp:.4f}\n"
                 f"Max VM: {max_vm:.2f}\n\n"
@@ -3517,7 +3517,7 @@ class NastranToolApp:
         except Exception as exc:
             error_msg = str(exc)
             self._log(f"\nHATA: {error_msg}")
-            self.root.after(0, lambda msg=error_msg: messagebox.showerror("Hata", msg))
+            self.root.after(0, lambda msg=error_msg: messagebox.showerror("Error", msg))
         finally:
             for _f in (_iter_file, self._log_file):
                 if _f is not None:
